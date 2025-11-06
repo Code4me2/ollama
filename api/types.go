@@ -117,6 +117,12 @@ type GenerateRequest struct {
 	// DebugRenderOnly is a debug option that, when set to true, returns the rendered
 	// template instead of calling the model.
 	DebugRenderOnly bool `json:"_debug_render_only,omitempty"`
+
+	// Tools is a list of tools the model may call.
+	Tools []Tool `json:"tools,omitempty"`
+
+	// MCPServers specifies MCP servers to use for tool functionality
+	MCPServers []MCPServerConfig `json:"mcp_servers,omitempty"`
 }
 
 // ChatRequest describes a request sent by [Client.Chat].
@@ -159,6 +165,26 @@ type ChatRequest struct {
 	// DebugRenderOnly is a debug option that, when set to true, returns the rendered
 	// template instead of calling the model.
 	DebugRenderOnly bool `json:"_debug_render_only,omitempty"`
+
+	// MCPServers is an optional list of MCP (Model Context Protocol) servers
+	// that provide tools for autonomous execution during the chat.
+	MCPServers []MCPServerConfig `json:"mcp_servers,omitempty"`
+
+	// MaxToolRounds limits the number of tool execution rounds to prevent
+	// infinite loops. Defaults to 15 if not specified.
+	MaxToolRounds int `json:"max_tool_rounds,omitempty"`
+
+	// ToolTimeout sets the timeout for individual tool executions.
+	// Defaults to 30 seconds if not specified.
+	ToolTimeout *Duration `json:"tool_timeout,omitempty"`
+
+	// SessionID is an optional session identifier for maintaining MCP state
+	// across multiple API calls. If not provided, a new session is created.
+	SessionID string `json:"session_id,omitempty"`
+
+	// ToolsPath is the file path passed via --tools flag in interactive mode.
+	// Used to generate consistent session IDs for tool continuity.
+	ToolsPath string `json:"tools_path,omitempty"`
 }
 
 type Tools []Tool
@@ -181,10 +207,11 @@ type Message struct {
 	Content string `json:"content"`
 	// Thinking contains the text that was inside thinking tags in the
 	// original model output when ChatRequest.Think is enabled.
-	Thinking  string      `json:"thinking,omitempty"`
-	Images    []ImageData `json:"images,omitempty"`
-	ToolCalls []ToolCall  `json:"tool_calls,omitempty"`
-	ToolName  string      `json:"tool_name,omitempty"`
+	Thinking    string       `json:"thinking,omitempty"`
+	Images      []ImageData  `json:"images,omitempty"`
+	ToolCalls   []ToolCall   `json:"tool_calls,omitempty"`
+	ToolResults []ToolResult `json:"tool_results,omitempty"`
+	ToolName    string       `json:"tool_name,omitempty"`
 }
 
 func (m *Message) UnmarshalJSON(b []byte) error {
@@ -201,6 +228,12 @@ func (m *Message) UnmarshalJSON(b []byte) error {
 
 type ToolCall struct {
 	Function ToolCallFunction `json:"function"`
+}
+
+type ToolResult struct {
+	ToolName string `json:"tool_name"`
+	Content  string `json:"content"`
+	Error    string `json:"error,omitempty"`
 }
 
 type ToolCallFunction struct {
@@ -339,6 +372,21 @@ type ToolFunction struct {
 func (t *ToolFunction) String() string {
 	bts, _ := json.Marshal(t)
 	return string(bts)
+}
+
+// MCPServerConfig represents configuration for an MCP (Model Context Protocol) server
+type MCPServerConfig struct {
+	// Name is a unique identifier for the MCP server
+	Name string `json:"name"`
+
+	// Command is the executable command to start the MCP server
+	Command string `json:"command"`
+
+	// Args are optional command-line arguments for the MCP server
+	Args []string `json:"args,omitempty"`
+
+	// Env are optional environment variables for the MCP server
+	Env map[string]string `json:"env,omitempty"`
 }
 
 // ChatResponse is the response returned by [Client.Chat]. Its fields are
@@ -672,7 +720,8 @@ type GenerateResponse struct {
 
 	Metrics
 
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	ToolCalls   []ToolCall   `json:"tool_calls,omitempty"`
+	ToolResults []ToolResult `json:"tool_results,omitempty"`
 
 	DebugInfo *DebugInfo `json:"_debug_info,omitempty"`
 }

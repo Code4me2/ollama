@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -48,6 +49,13 @@ import (
 )
 
 const ConnectInstructions = "To sign in, navigate to:\n    %s\n\n"
+
+// Tool detection and buffering configuration
+const (
+	DefaultToolBufferDelay = 500 * time.Millisecond
+	MinToolBufferDelay     = 100 * time.Millisecond
+	MaxToolBufferDelay     = 2 * time.Second
+)
 
 // ensureThinkingSupport emits a warning if the model does not advertise thinking support
 func ensureThinkingSupport(ctx context.Context, client *api.Client, name string) {
@@ -376,6 +384,65 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 			return err
 		}
 		opts.KeepAlive = &api.Duration{Duration: d}
+	}
+
+	toolsSpec, err := cmd.Flags().GetString("tools")
+	if err != nil {
+		return err
+	}
+	if toolsSpec != "" {
+		// Parse tools specification: "type:path" or just "path" for filesystem
+		parts := strings.SplitN(toolsSpec, ":", 2)
+		serverType := "filesystem"
+		path := toolsSpec
+		
+		if len(parts) == 2 {
+			serverType = parts[0]
+			path = parts[1]
+		}
+		
+		// For backward compatibility, treat plain paths as filesystem
+		if !strings.Contains(toolsSpec, ":") && strings.HasPrefix(toolsSpec, "/") {
+			serverType = "filesystem"
+			path = toolsSpec
+		}
+		
+		// Create MCP server config based on type
+		switch serverType {
+		case "filesystem", "fs":
+			opts.MCPServers = []api.MCPServerConfig{
+				{
+					Name:    "filesystem",
+					Command: "npx",
+					Args:    []string{"@modelcontextprotocol/server-filesystem", path},
+				},
+			}
+		case "git":
+			opts.MCPServers = []api.MCPServerConfig{
+				{
+					Name:    "git",
+					Command: "npx",
+					Args:    []string{"@modelcontextprotocol/server-git", path},
+				},
+			}
+		case "python":
+			opts.MCPServers = []api.MCPServerConfig{
+				{
+					Name:    "python",
+					Command: "python",
+					Args:    []string{"-m", "mcp_server_python"},
+				},
+			}
+		default:
+			// Try to use as a raw MCP server command
+			opts.MCPServers = []api.MCPServerConfig{
+				{
+					Name:    serverType,
+					Command: serverType,
+					Args:    strings.Fields(path),
+				},
+			}
+		}
 	}
 
 	prompts := args[1:]
@@ -1121,6 +1188,7 @@ type runOptions struct {
 	Think        *api.ThinkValue
 	HideThinking bool
 	ShowConnect  bool
+	MCPServers   []api.MCPServerConfig
 }
 
 func (r runOptions) Copy() runOptions {
@@ -1150,6 +1218,12 @@ func (r runOptions) Copy() runOptions {
 		think = &cThink
 	}
 
+	var mcpServers []api.MCPServerConfig
+	if r.MCPServers != nil {
+		mcpServers = make([]api.MCPServerConfig, len(r.MCPServers))
+		copy(mcpServers, r.MCPServers)
+	}
+
 	return runOptions{
 		Model:        r.Model,
 		ParentModel:  r.ParentModel,
@@ -1165,12 +1239,191 @@ func (r runOptions) Copy() runOptions {
 		Think:        think,
 		HideThinking: r.HideThinking,
 		ShowConnect:  r.ShowConnect,
+		MCPServers:   mcpServers,
 	}
 }
 
 type displayResponseState struct {
 	lineLength int
 	wordBuffer string
+}
+
+// StreamingToolDetector maintains state for detecting tool calls across streaming chunks
+type StreamingToolDetector struct {
+	inXMLToolCall  bool
+	xmlStartBuffer strings.Builder
+	inJSONToolCall bool
+	jsonBuffer     strings.Builder
+	jsonDepth      int
+	inString       bool
+	escapeNext     bool
+}
+
+// NewStreamingToolDetector creates a new stateful tool detector
+func NewStreamingToolDetector() *StreamingToolDetector {
+	return &StreamingToolDetector{}
+}
+
+// Process handles a chunk of streaming content and separates tool calls from regular content
+func (s *StreamingToolDetector) Process(chunk string) (displayContent string, hasIncompleteToolCall bool) {
+	var result strings.Builder
+	
+	for i := 0; i < len(chunk); i++ {
+		ch := chunk[i]
+		
+		// Handle XML tool calls
+		if !s.inXMLToolCall && i+11 <= len(chunk) && chunk[i:i+11] == "<tool_call>" {
+			s.inXMLToolCall = true
+			s.xmlStartBuffer.Reset()
+			s.xmlStartBuffer.WriteString("<tool_call>")
+			i += 10 // Skip past "<tool_call>"
+			continue
+		}
+		
+		if s.inXMLToolCall {
+			s.xmlStartBuffer.WriteByte(ch)
+			if i+12 <= len(chunk) && chunk[i:i+12] == "</tool_call>" {
+				// Complete XML tool call - skip it entirely
+				s.inXMLToolCall = false
+				s.xmlStartBuffer.Reset()
+				i += 11 // Skip past "</tool_call>"
+				continue
+			}
+			continue
+		}
+		
+		// Handle JSON tool calls
+		if !s.inJSONToolCall && !s.inXMLToolCall {
+			// Look for start of JSON tool call pattern
+			if i+8 <= len(chunk) && chunk[i:i+8] == `{"name":` {
+				// Check if "arguments" appears nearby (tool call signature)
+				lookahead := chunk[i:]
+				if len(lookahead) > 200 {
+					lookahead = lookahead[:200]
+				}
+				if strings.Contains(lookahead, `"arguments":`) {
+					s.inJSONToolCall = true
+					s.jsonBuffer.Reset()
+					s.jsonBuffer.WriteByte(ch)
+					s.jsonDepth = 1
+					s.inString = false
+					s.escapeNext = false
+					continue
+				}
+			}
+		}
+		
+		if s.inJSONToolCall {
+			s.jsonBuffer.WriteByte(ch)
+			
+			// Track JSON structure to find the end
+			if s.escapeNext {
+				s.escapeNext = false
+				continue
+			}
+			
+			if ch == '\\' && s.inString {
+				s.escapeNext = true
+				continue
+			}
+			
+			if ch == '"' && !s.escapeNext {
+				s.inString = !s.inString
+				continue
+			}
+			
+			if !s.inString {
+				if ch == '{' {
+					s.jsonDepth++
+				} else if ch == '}' {
+					s.jsonDepth--
+					if s.jsonDepth == 0 {
+						// Complete JSON tool call - skip it
+						s.inJSONToolCall = false
+						s.jsonBuffer.Reset()
+						continue
+					}
+				}
+			}
+			continue
+		}
+		
+		// Regular content
+		result.WriteByte(ch)
+	}
+	
+	// Check if we have incomplete tool calls that need buffering
+	hasIncompleteToolCall = s.inXMLToolCall || s.inJSONToolCall
+	
+	return result.String(), hasIncompleteToolCall
+}
+
+// Reset clears the detector state
+func (s *StreamingToolDetector) Reset() {
+	s.inXMLToolCall = false
+	s.xmlStartBuffer.Reset()
+	s.inJSONToolCall = false
+	s.jsonBuffer.Reset()
+	s.jsonDepth = 0
+	s.inString = false
+	s.escapeNext = false
+}
+
+// findJSONEnd finds the end of a JSON object starting from the beginning of the string
+// Returns the index of the closing brace, or -1 if not found
+func findJSONEnd(s string) int {
+	braceCount := 0
+	inString := false
+	escapeNext := false
+	
+	for i, ch := range s {
+		if escapeNext {
+			escapeNext = false
+			continue
+		}
+		
+		if ch == '\\' && inString {
+			escapeNext = true
+			continue
+		}
+		
+		if ch == '"' && !escapeNext {
+			inString = !inString
+			continue
+		}
+		
+		if !inString {
+			if ch == '{' {
+				braceCount++
+			} else if ch == '}' {
+				braceCount--
+				if braceCount == 0 {
+					return i
+				}
+			}
+		}
+	}
+	
+	return -1
+}
+
+// getToolBufferDelay returns the configured tool buffer delay
+// Can be overridden with OLLAMA_TOOL_BUFFER_DELAY environment variable (in milliseconds)
+func getToolBufferDelay() time.Duration {
+	if delayStr := os.Getenv("OLLAMA_TOOL_BUFFER_DELAY"); delayStr != "" {
+		if delayMs, err := strconv.Atoi(delayStr); err == nil {
+			delay := time.Duration(delayMs) * time.Millisecond
+			// Clamp to reasonable bounds
+			if delay < MinToolBufferDelay {
+				return MinToolBufferDelay
+			}
+			if delay > MaxToolBufferDelay {
+				return MaxToolBufferDelay
+			}
+			return delay
+		}
+	}
+	return DefaultToolBufferDelay
 }
 
 func displayResponse(content string, wordWrap bool, state *displayResponseState) {
@@ -1271,6 +1524,18 @@ func chat(cmd *cobra.Command, opts runOptions) (*api.Message, error) {
 	var fullResponse strings.Builder
 	var thinkTagOpened bool = false
 	var thinkTagClosed bool = false
+	var toolCallsDisplayed bool = false
+	
+	// Streaming tool detector for better chunk handling
+	toolDetector := NewStreamingToolDetector()
+	
+	// Buffer for accumulating content before display
+	var contentBuffer strings.Builder
+	var bufferTimer *time.Timer
+	var bufferMutex sync.Mutex
+	
+	// Get configurable buffer delay
+	bufferDelay := getToolBufferDelay()
 
 	role := "assistant"
 
@@ -1302,20 +1567,69 @@ func chat(cmd *cobra.Command, opts runOptions) (*api.Message, error) {
 			thinkTagClosed = true
 			state = &displayResponseState{}
 		}
-		// purposefully not putting thinking blocks in the response, which would
-		// only be needed if we later added tool calling to the cli (they get
-		// filtered out anyway since current models don't expect them unless you're
-		// about to finish some tool calls)
+		
+		// Use stateful tool detector for better streaming chunk handling
+		displayContent, hasIncompleteToolCall := toolDetector.Process(content)
+		
+		// Store full response for context
 		fullResponse.WriteString(content)
 
-		if response.Message.ToolCalls != nil {
-			toolCalls := response.Message.ToolCalls
-			if len(toolCalls) > 0 {
-				fmt.Print(renderToolCalls(toolCalls, false))
+		// Buffer management based on tool detection
+		if hasIncompleteToolCall {
+			// We have an incomplete tool call - buffer the content
+			bufferMutex.Lock()
+			contentBuffer.WriteString(displayContent)
+			
+			// Cancel any existing timer
+			if bufferTimer != nil {
+				bufferTimer.Stop()
+			}
+			
+			// Set a new timer to flush the buffer after a delay
+			bufferTimer = time.AfterFunc(bufferDelay, func() {
+				bufferMutex.Lock()
+				defer bufferMutex.Unlock()
+				
+				bufferedContent := contentBuffer.String()
+				contentBuffer.Reset()
+				
+				// Reset tool detector state when flushing
+				toolDetector.Reset()
+				
+				// Only display if there's actual content after filtering
+				if strings.TrimSpace(bufferedContent) != "" {
+					displayResponse(bufferedContent, opts.WordWrap, state)
+				}
+			})
+			bufferMutex.Unlock()
+		} else {
+			// No incomplete tool call - display immediately
+			if strings.TrimSpace(displayContent) != "" {
+				displayResponse(displayContent, opts.WordWrap, state)
 			}
 		}
-
-		displayResponse(content, opts.WordWrap, state)
+		
+		// Display tool calls cleanly if detected
+		if response.Message.ToolCalls != nil {
+			toolCalls := response.Message.ToolCalls
+			if len(toolCalls) > 0 && !toolCallsDisplayed {
+				// Only add newline if we displayed content
+				if strings.TrimSpace(displayContent) != "" {
+					fmt.Println()
+				}
+				fmt.Print(renderToolCalls(toolCalls, false))
+				toolCallsDisplayed = true
+			}
+		}
+		
+		// Display tool results if available
+		if response.Message.ToolResults != nil {
+			toolResults := response.Message.ToolResults
+			if len(toolResults) > 0 {
+				fmt.Print(renderToolResults(toolResults, false))
+				fmt.Println() // New line after results
+			}
+		}
 
 		return nil
 	}
@@ -1325,11 +1639,12 @@ func chat(cmd *cobra.Command, opts runOptions) (*api.Message, error) {
 	}
 
 	req := &api.ChatRequest{
-		Model:    opts.Model,
-		Messages: opts.Messages,
-		Format:   json.RawMessage(opts.Format),
-		Options:  opts.Options,
-		Think:    opts.Think,
+		Model:      opts.Model,
+		Messages:   opts.Messages,
+		Format:     json.RawMessage(opts.Format),
+		Options:    opts.Options,
+		Think:      opts.Think,
+		MCPServers: opts.MCPServers,
 	}
 
 	if opts.KeepAlive != nil {
@@ -1350,6 +1665,20 @@ func chat(cmd *cobra.Command, opts runOptions) (*api.Message, error) {
 		}
 		return nil, err
 	}
+	
+	// Flush any remaining buffered content
+	bufferMutex.Lock()
+	if bufferTimer != nil {
+		bufferTimer.Stop()
+	}
+	if contentBuffer.Len() > 0 {
+		bufferedContent := contentBuffer.String()
+		contentBuffer.Reset()
+		if strings.TrimSpace(bufferedContent) != "" && !strings.Contains(bufferedContent, `{"name":`) {
+			displayResponse(bufferedContent, opts.WordWrap, state)
+		}
+	}
+	bufferMutex.Unlock()
 
 	if len(opts.Messages) > 0 {
 		fmt.Println()
@@ -1402,6 +1731,7 @@ func generate(cmd *cobra.Command, opts runOptions) error {
 	var thinkingContent strings.Builder
 	var thinkTagOpened bool = false
 	var thinkTagClosed bool = false
+	var toolCallsDisplayed bool = false
 
 	plainText := !term.IsTerminal(int(os.Stdout.Fd()))
 
@@ -1437,8 +1767,16 @@ func generate(cmd *cobra.Command, opts runOptions) error {
 
 		if response.ToolCalls != nil {
 			toolCalls := response.ToolCalls
-			if len(toolCalls) > 0 {
+			if len(toolCalls) > 0 && !toolCallsDisplayed {
 				fmt.Print(renderToolCalls(toolCalls, plainText))
+				toolCallsDisplayed = true
+			}
+		}
+		
+		if response.ToolResults != nil {
+			toolResults := response.ToolResults
+			if len(toolResults) > 0 {
+				fmt.Print(renderToolResults(toolResults, plainText))
 			}
 		}
 
@@ -1457,15 +1795,16 @@ func generate(cmd *cobra.Command, opts runOptions) error {
 	}
 
 	request := api.GenerateRequest{
-		Model:     opts.Model,
-		Prompt:    opts.Prompt,
-		Context:   generateContext,
-		Images:    opts.Images,
-		Format:    json.RawMessage(opts.Format),
-		System:    opts.System,
-		Options:   opts.Options,
-		KeepAlive: opts.KeepAlive,
-		Think:     opts.Think,
+		Model:      opts.Model,
+		Prompt:     opts.Prompt,
+		Context:    generateContext,
+		Images:     opts.Images,
+		Format:     json.RawMessage(opts.Format),
+		System:     opts.System,
+		Options:    opts.Options,
+		KeepAlive:  opts.KeepAlive,
+		Think:      opts.Think,
+		MCPServers: opts.MCPServers,
 	}
 
 	if err := client.Generate(ctx, &request, fn); err != nil {
@@ -1684,6 +2023,7 @@ func NewCLI() *cobra.Command {
 	runCmd.Flags().String("think", "", "Enable thinking mode: true/false or high/medium/low for supported models")
 	runCmd.Flags().Lookup("think").NoOptDefVal = "true"
 	runCmd.Flags().Bool("hidethinking", false, "Hide thinking output (if provided)")
+	runCmd.Flags().String("tools", "", "Enable MCP tools (filesystem:/path, git:/repo, python, or custom:args)")
 
 	stopCmd := &cobra.Command{
 		Use:     "stop MODEL",
@@ -1894,15 +2234,78 @@ func renderToolCalls(toolCalls []api.ToolCall, plainText bool) string {
 		out += formatExplanation
 	}
 	for i, toolCall := range toolCalls {
-		argsAsJSON, err := json.Marshal(toolCall.Function.Arguments)
-		if err != nil {
-			return ""
-		}
 		if i > 0 {
 			out += "\n"
 		}
-		// all tool calls are unexpected since we don't currently support registering any in the CLI
-		out += fmt.Sprintf("  Model called a non-existent function '%s()' with arguments: %s", formatValues+toolCall.Function.Name+formatExplanation, formatValues+string(argsAsJSON)+formatExplanation)
+		// Format arguments in a more readable way
+		var argsDisplay string
+		// Arguments is already a map[string]any
+		var pairs []string
+		for k, v := range toolCall.Function.Arguments {
+			pairs = append(pairs, fmt.Sprintf("%s: %v", k, v))
+		}
+		if len(pairs) > 0 {
+			argsDisplay = strings.Join(pairs, ", ")
+		} else {
+			argsDisplay = "(no arguments)"
+		}
+		
+		// Show tool execution in progress with cleaner format
+		out += fmt.Sprintf("\n🔧 Executing tool '%s' with arguments: %s%s%s\n", 
+			formatValues+toolCall.Function.Name+formatExplanation, 
+			formatValues, argsDisplay, formatExplanation)
+	}
+	if !plainText {
+		out += readline.ColorDefault
+	}
+	return out
+}
+
+func renderToolResults(toolResults []api.ToolResult, plainText bool) string {
+	out := ""
+	formatExplanation := ""
+	formatValues := ""
+	formatError := ""
+	if !plainText {
+		formatExplanation = readline.ColorGrey + readline.ColorBold
+		formatValues = readline.ColorDefault
+		// Use bold for errors since ColorRed doesn't exist
+		formatError = readline.ColorBold
+		out += formatExplanation
+	}
+	for i, toolResult := range toolResults {
+		if i > 0 {
+			out += "\n"
+		}
+		if toolResult.Error != "" {
+			// Parse error for better context
+			errorMsg := toolResult.Error
+			// Try to extract meaningful error from MCP errors
+			if strings.Contains(errorMsg, "MCP tool returned error") {
+				errorMsg = "Tool execution failed"
+			}
+			// Look for specific error patterns
+			if strings.Contains(toolResult.Error, "Parent directory does not exist") {
+				errorMsg = "Parent directory does not exist - check path"
+			} else if strings.Contains(toolResult.Error, "permission denied") {
+				errorMsg = "Permission denied - insufficient privileges"
+			} else if strings.Contains(toolResult.Error, "Invalid arguments") {
+				errorMsg = "Invalid tool arguments provided"
+			} else if strings.Contains(toolResult.Error, "file not found") {
+				errorMsg = "File or directory not found"
+			}
+			
+			out += fmt.Sprintf("❌ Tool '%s' failed: %s%s%s\n", 
+				formatValues+toolResult.ToolName+formatExplanation, 
+				formatError, errorMsg, formatExplanation)
+		} else {
+			// Truncate very long results for display
+			content := toolResult.Content
+			if len(content) > 200 {
+				content = content[:197] + "..."
+			}
+			out += fmt.Sprintf("✅ Tool '%s' result: %s\n", formatValues+toolResult.ToolName+formatExplanation, formatValues+content+formatExplanation)
+		}
 	}
 	if !plainText {
 		out += readline.ColorDefault
