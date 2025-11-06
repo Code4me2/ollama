@@ -431,13 +431,17 @@ func FromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 				toolName = nameFromToolCallID(r.Messages, msg.ToolCallID)
 			}
 		}
+		toolCallID := ""
+		if msg.ToolCallID != "" {
+			toolCallID = msg.ToolCallID
+		}
 		switch content := msg.Content.(type) {
 		case string:
 			toolCalls, err := FromCompletionToolCall(msg.ToolCalls)
 			if err != nil {
 				return nil, err
 			}
-			messages = append(messages, api.Message{Role: msg.Role, Content: content, Thinking: msg.Reasoning, ToolCalls: toolCalls, ToolName: toolName})
+			messages = append(messages, api.Message{Role: msg.Role, Content: content, Thinking: msg.Reasoning, ToolCalls: toolCalls, ToolName: toolName, ToolCallID: toolCallID})
 		case []any:
 			for _, c := range content {
 				data, ok := c.(map[string]any)
@@ -503,6 +507,7 @@ func FromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 				messages[len(messages)-1].ToolCalls = toolCalls
 				if toolName != "" {
 					messages[len(messages)-1].ToolName = toolName
+					messages[len(messages)-1].ToolCallID = toolCallID
 				}
 				messages[len(messages)-1].Thinking = msg.Reasoning
 			}
@@ -520,7 +525,7 @@ func FromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 					return nil, errors.New("invalid tool call arguments")
 				}
 			}
-			messages = append(messages, api.Message{Role: msg.Role, Thinking: msg.Reasoning, ToolCalls: toolCalls})
+			messages = append(messages, api.Message{Role: msg.Role, Thinking: msg.Reasoning, ToolCalls: toolCalls, ToolCallID: toolCallID})
 		}
 	}
 
@@ -631,6 +636,7 @@ func nameFromToolCallID(messages []Message, toolCallID string) string {
 func FromCompletionToolCall(toolCalls []ToolCall) ([]api.ToolCall, error) {
 	apiToolCalls := make([]api.ToolCall, len(toolCalls))
 	for i, tc := range toolCalls {
+		apiToolCalls[i].ID = tc.ID
 		apiToolCalls[i].Function.Name = tc.Function.Name
 		err := json.Unmarshal([]byte(tc.Function.Arguments), &apiToolCalls[i].Function.Arguments)
 		if err != nil {
