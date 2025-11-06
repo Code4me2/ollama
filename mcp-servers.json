@@ -1,0 +1,13 @@
+{
+  "servers": [
+    {
+      "name": "filesystem",
+      "description": "File system operations with path-based access control",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem"],
+      "requires_path": true,
+      "path_arg_index": -1,
+      "capabilities": ["read", "write", "list", "search"]
+    }
+  ]
+}

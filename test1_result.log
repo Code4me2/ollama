@@ -1,0 +1,24 @@
+[?2026h[?25l[1G⠙ [K[?25h[?2026l[?2026h[?25l[1G⠙ [K[?25h[?2026l[?2026h[?25l[1G⠹ [K[?25h[?2026l[?2026h[?25l[1G⠼ [K[?25h[?2026l[?2026h[?25l[1G⠼ [K[?25h[?2026l[?2026h[?25l[1G⠴ [K[?25h[?2026l[?2026h[?25l[1G⠦ [K[?25h[?2026l[?2026h[?25l[1G⠇ [K[?25h[?2026l[?2026h[?25l[1G⠏ [K[?25h[?2026l[?2026h[?25l[1G⠏ [K[?25h[?2026l[?2026h[?25l[1G⠋ [K[?25h[?2026l[?2026h[?25l[1G⠹ [K[?25h[?2026l[?2026h[?25l[1G⠹ [K[?25h[?2026l[?2026h[?25l[1G⠸ [K[?25h[?2026l[?2026h[?25l[1G⠼ [K[?25h[?2026l[?2026h[?25l[1G⠦ [K[?25h[?2026l[?2026h[?25l[1G⠦ [K[?25h[?2026l[?2026h[?25l[1G⠧ [K[?25h[?2026l[?2026h[?25l[1G⠏ [K[?25h[?2026l[?2026h[?25l[1G⠋ [K[?25h[?2026l[?2026h[?25l[1G⠙ [K[?25h[?2026l[?2026h[?25l[1G⠙ [K[?25h[?2026l[?2026h[?25l[1G⠹ [K[?25h[?2026l[?25l[?2026h[?25l[1G[K[?25h[?2026l[2K[1G[?25h  🔧 Executing tool 'filesystem:list_directory' with arguments: {"path":"/home/velvetm/Desktop/mcp-test-files"}[?25l[?25h  ✅ Tool 'filesystem:list_directory' result: [FILE] chain_test.txt
+[FILE] demo.txt
+[FILE] example.md
+[DIR] new-destination
+[FILE] newfile.txt
+[FILE] output.txt
+[FILE] sequential_test.txt
+[FILE] test.txt
+[FILE] test_multi.txt[?25l[?25h The[?25l[?25h test[?25l[?25h directory[?25l[?25h contains[?25l[?25h the[?25l[?25h following[?25l[?25h files[?25l[?25h and[?25l[?25h directories[?25l[?25h:[?25l[?25h
+
+Files[?25l[?25h:[?25l[?25h
+-[?25l[?25h `[?25l[?25hchain[?25l[?25h_test[?25l[?25h.txt[?25l[?25h`[?25l[?25h
+-[?25l[?25h `[?25l[?25hdemo[?25l[?25h.txt[?25l[?25h`[?25l[?25h
+-[?25l[?25h `[?25l[?25hexample[?25l[?25h.md[?25l[?25h`[?25l[?25h
+-[?25l[?25h `[?25l[?25hnew[?25l[?25hfile[?25l[?25h.txt[?25l[?25h`[?25l[?25h
+-[?25l[?25h `[?25l[?25houtput[?25l[?25h.txt[?25l[?25h`[?25l[?25h
+-[?25l[?25h `[?25l[?25hsequential[?25l[?25h_test[?25l[?25h.txt[?25l[?25h`[?25l[?25h
+-[?25l[?25h `[?25l[?25htest[?25l[?25h.txt[?25l[?25h`[?25l[?25h
+-[?25l[?25h `[?25l[?25htest[?25l[?25h_multi[?25l[?25h.txt[?25l[?25h`[?25l[?25h
+
+Directories[?25l[?25h:[?25l[?25h
+-[?25l[?25h `[?25l[?25hnew[?25l[?25h-[?25l[?25hdestination[?25l[?25h`[?25l[?25h
+
+[?25l[?25h

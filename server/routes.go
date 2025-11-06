@@ -50,6 +50,17 @@ import (
 	"github.com/ollama/ollama/version"
 )
 
+// CompletionResult holds the result of a completion request
+type CompletionResult struct {
+	Content      string
+	Thinking     string
+	ToolCalls    []api.ToolCall
+	Done         bool
+	DoneReason   string
+	Metrics      api.Metrics
+	Error        error
+}
+
 const signinURLStr = "https://ollama.com/connect?name=%s&key=%s"
 
 func shouldUseHarmony(model *Model) bool {
@@ -325,11 +336,12 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		m.Config.Parser = "harmony"
 	}
 
+
 	if !req.Raw && m.Config.Parser != "" {
 		builtinParser = parsers.ParserForName(m.Config.Parser)
 		if builtinParser != nil {
-			// no tools or last message for generate endpoint
-			builtinParser.Init(nil, nil)
+			// Pass tools to parser for proper initialization
+			builtinParser.Init(req.Tools, nil)
 		}
 	}
 
@@ -355,6 +367,61 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("%q does not support thinking", req.Model)})
 			return
 		}
+	}
+
+	// Initialize MCP manager if MCP servers are configured
+	var mcpManager *MCPManager
+	if len(req.MCPServers) > 0 {
+		mcpManager = NewMCPManager(10) // Allow up to 10 MCP servers
+		for _, mcpConfig := range req.MCPServers {
+			if err := mcpManager.AddServer(mcpConfig); err != nil {
+				// Log error but continue with other servers
+				slog.Warn("Failed to initialize MCP server", "name", mcpConfig.Name, "error", err)
+			}
+		}
+
+		// Add MCP tools to the existing tools
+		mcpTools := mcpManager.GetAllTools()
+		req.Tools = append(req.Tools, mcpTools...)
+
+		// Inject MCP context for better tool usage (GenerateHandler)
+		codeAPI := NewMCPCodeAPI(mcpManager)
+		context := codeAPI.GenerateMinimalContext(req.MCPServers)
+		slog.Info("GenerateHandler context injection", "context_length", len(context))
+		if context != "" {
+			// For GenerateRequest, prepend context to prompt
+			slog.Info("Prepending context to prompt", "original_prompt_length", len(req.Prompt))
+			req.Prompt = context + "\n\n" + req.Prompt
+			slog.Info("Updated prompt", "new_prompt_length", len(req.Prompt))
+		}
+
+		// Auto-configure parser for tools if needed (after MCP tools are added)
+		if len(req.Tools) > 0 && m.Config.Parser == "" {
+			if m.Config.ModelFamily == "qwen2" || m.Config.ModelFamily == "qwen3" {
+				m.Config.Parser = "qwen3-vl-instruct"
+			} else {
+			}
+		}
+
+		// Re-initialize builtin parser if auto-configured  
+		if !req.Raw && m.Config.Parser != "" && builtinParser == nil {
+			builtinParser = parsers.ParserForName(m.Config.Parser)
+			if builtinParser != nil {
+				builtinParser.Init(req.Tools, nil)
+			}
+		}
+
+		// Update capabilities if we now have tools
+		if len(req.Tools) > 0 && !slices.Contains(caps, model.CapabilityTools) {
+			caps = append(caps, model.CapabilityTools)
+		}
+
+		// Ensure cleanup happens
+		defer func() {
+			if err := mcpManager.Close(); err != nil {
+				slog.Warn("Error closing MCP manager", "error", err)
+			}
+		}()
 	}
 
 	r, m, opts, err := s.scheduleRunner(c.Request.Context(), name.String(), caps, req.Options, req.KeepAlive)
@@ -447,7 +514,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		// the real chat handler, but doing this as a stopgap to get renderer
 		// support for generate
 		if values.Messages != nil && values.Suffix == "" && req.Template == "" {
-			prompt, images, err = chatPrompt(c.Request.Context(), m, r.Tokenize, opts, values.Messages, []api.Tool{}, req.Think, req.Truncate == nil || *req.Truncate)
+			prompt, images, err = chatPrompt(c.Request.Context(), m, r.Tokenize, opts, values.Messages, req.Tools, req.Think, req.Truncate == nil || *req.Truncate)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 				return
@@ -498,9 +565,173 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 	ch := make(chan any)
 	go func() {
 		// TODO (jmorganca): avoid building the response twice both here and below
-		var sb strings.Builder
 		defer close(ch)
-		if err := r.Completion(c.Request.Context(), llm.CompletionRequest{
+		
+		// Multi-round execution for MCP tools - only when tools are present
+		if len(req.Tools) > 0 || mcpManager != nil {
+			maxRounds := 15 // Default for GenerateHandler
+			currentPrompt := prompt
+			
+			for round := 0; round < maxRounds; round++ {
+				var sb strings.Builder
+				toolsExecuted := false
+				
+				if err := r.Completion(c.Request.Context(), llm.CompletionRequest{
+					Prompt:   currentPrompt,
+					Images:   images,
+					Format:   req.Format,
+					Options:  opts,
+					Shift:    req.Shift == nil || *req.Shift,
+					Truncate: req.Truncate == nil || *req.Truncate,
+				}, func(cr llm.CompletionResponse) {
+					res := api.GenerateResponse{
+						Model:     req.Model,
+						CreatedAt: time.Now().UTC(),
+						Response:  cr.Content,
+						Done:      cr.Done,
+						Metrics: api.Metrics{
+							PromptEvalCount:    cr.PromptEvalCount,
+							PromptEvalDuration: cr.PromptEvalDuration,
+							EvalCount:          cr.EvalCount,
+							EvalDuration:       cr.EvalDuration,
+						},
+					}
+
+					if builtinParser != nil {
+						content, thinking, toolCalls, err := builtinParser.Add(cr.Content, cr.Done)
+						if err != nil {
+							ch <- gin.H{"error": err.Error()}
+							return
+						}
+						res.Response = content
+						res.Thinking = thinking
+						
+						
+						if cr.Done && len(toolCalls) > 0 {
+							res.ToolCalls = toolCalls
+							
+							// Execute tools via MCP when completion is done
+							if mcpManager != nil {
+								
+								// Analyze tool calls to determine execution strategy
+								executionPlan := mcpManager.AnalyzeExecutionPlan(toolCalls)
+								
+								// Log the execution plan for debugging
+								slog.Info("Tool execution strategy determined",
+									"sequential", executionPlan.RequiresSequential,
+									"reason", executionPlan.Reason,
+									"tool_count", len(toolCalls))
+								
+								// Execute tools according to the plan
+								results := mcpManager.ExecuteWithPlan(toolCalls, executionPlan)
+								
+								// Send the tool calls response to client first
+								ch <- res
+								
+								// Send tool results to client
+								toolResults := make([]api.ToolResult, len(results))
+								for i, result := range results {
+									toolResults[i] = api.ToolResult{
+										ToolName: toolCalls[i].Function.Name,
+										Content:  result.Content,
+									}
+									if result.Error != nil {
+										toolResults[i].Error = result.Error.Error()
+									}
+								}
+								
+								// Send tool results response
+								toolResultResponse := api.GenerateResponse{
+									Model:       req.Model,
+									CreatedAt:   time.Now().UTC(),
+									Response:    "",
+									Done:        false,
+									ToolResults: toolResults,
+								}
+								ch <- toolResultResponse
+								
+								// Build new prompt with tool results for next round
+								var promptBuilder strings.Builder
+								promptBuilder.WriteString(currentPrompt)
+								promptBuilder.WriteString("\n\nAssistant: ")
+								
+								// Add tool calls to prompt
+								for _, call := range toolCalls {
+									promptBuilder.WriteString(fmt.Sprintf("<tool_call>{\"name\": \"%s\", \"arguments\": %s}</tool_call>\n", call.Function.Name, call.Function.Arguments))
+								}
+								
+								// Add tool results to prompt
+								for i, result := range results {
+									promptBuilder.WriteString(fmt.Sprintf("<tool_result name=\"%s\">", toolCalls[i].Function.Name))
+									if result.Error != nil {
+													promptBuilder.WriteString(fmt.Sprintf("Error: %v", result.Error))
+									} else {
+													promptBuilder.WriteString(result.Content)
+									}
+									promptBuilder.WriteString("</tool_result>\n")
+								}
+								
+								promptBuilder.WriteString("\nHuman: Please interpret the tool results and provide a response.\n\nAssistant:")
+								currentPrompt = promptBuilder.String()
+								
+								// Signal that we need to continue to next round
+								toolsExecuted = true
+								return
+							}
+						}
+					} else if thinkingState != nil {
+						thinking, content := thinkingState.AddContent(cr.Content)
+						res.Thinking = thinking
+						res.Response = content
+					}
+
+					if _, err := sb.WriteString(cr.Content); err != nil {
+						ch <- gin.H{"error": err.Error()}
+					}
+
+					if cr.Done {
+						res.DoneReason = cr.DoneReason.String()
+						res.TotalDuration = time.Since(checkpointStart)
+						res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
+
+						if !req.Raw {
+							tokens, err := r.Tokenize(c.Request.Context(), currentPrompt+sb.String())
+							if err != nil {
+								ch <- gin.H{"error": err.Error()}
+								return
+							}
+							res.Context = tokens
+						}
+					}
+
+					if builtinParser != nil {
+						// only send messages with meaningful content (empty messages confuse clients)
+						if res.Response != "" || res.Thinking != "" || res.Done || len(res.ToolCalls) > 0 {
+							ch <- res
+						}
+						return
+					}
+
+					ch <- res
+				}); err != nil {
+					var serr api.StatusError
+					if errors.As(err, &serr) {
+						ch <- gin.H{"error": serr.ErrorMessage, "status": serr.StatusCode}
+					} else {
+						ch <- gin.H{"error": err.Error()}
+					}
+					return
+				}
+				
+				// If no tools were executed, break out of the loop
+				if !toolsExecuted {
+					break
+				}
+			}
+		} else {
+			// Original single-round execution when no tools are present
+			var sb strings.Builder
+			if err := r.Completion(c.Request.Context(), llm.CompletionRequest{
 			Prompt:   prompt,
 			Images:   images,
 			Format:   req.Format,
@@ -574,6 +805,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 			} else {
 				ch <- gin.H{"error": err.Error()}
 			}
+		}
 		}
 	}()
 
@@ -1478,6 +1710,10 @@ func (s *Server) GenerateRoutes(rc *ollama.Registry) (http.Handler, error) {
 	r.POST("/api/show", s.ShowHandler)
 	r.DELETE("/api/delete", s.DeleteHandler)
 
+	// MCP Tools discovery
+	r.GET("/api/tools", s.ToolsHandler)
+	r.POST("/api/tools", s.ToolsHandler)
+
 	r.POST("/api/me", s.WhoamiHandler)
 
 	r.POST("/api/signout", s.SignoutHandler)
@@ -1522,6 +1758,9 @@ func (s *Server) GenerateRoutes(rc *ollama.Registry) (http.Handler, error) {
 func Serve(ln net.Listener) error {
 	slog.SetDefault(logutil.NewLogger(os.Stderr, envconfig.LogLevel()))
 	slog.Info("server config", "env", envconfig.Values())
+
+	// Validate MCP installation and requirements
+	RunStartupValidation()
 
 	blobsDir, err := GetBlobsPath("")
 	if err != nil {
@@ -1812,6 +2051,168 @@ func (s *Server) PsHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, api.ProcessResponse{Models: models})
 }
 
+// executeCompletionWithTools executes a completion and collects the full response
+// This is a synchronous wrapper around the async completion callback
+func (s *Server) executeCompletionWithTools(
+	ctx context.Context,
+	r llm.LlamaServer,
+	prompt string,
+	images []llm.ImageData,
+	opts *api.Options,
+	req api.ChatRequest,
+	m *Model,
+	builtinParser parsers.Parser,
+	thinkingState *thinking.Parser,
+	ch chan any,
+	checkpointStart time.Time,
+	checkpointLoaded time.Time,
+	truncate bool,
+) (*CompletionResult, error) {
+	result := &CompletionResult{}
+	done := make(chan error, 1)
+	
+	// For tracking tool calls when using tools
+	var toolParser *tools.Parser
+	if len(req.Tools) > 0 && builtinParser == nil {
+		toolParser = tools.NewParser(m.Template.Template, req.Tools)
+	}
+	
+	// Track thinking content for structured outputs
+	var thinkingBuilder strings.Builder
+	
+	// Accumulate tool calls across streaming chunks
+	var accumulatedToolCalls []api.ToolCall
+	
+	// Create a new context for this completion
+	completionCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	
+	err := r.Completion(completionCtx, llm.CompletionRequest{
+		Prompt:   prompt,
+		Images:   images,
+		Format:   req.Format,
+		Options:  opts,
+		Shift:    req.Shift == nil || *req.Shift,
+		Truncate: truncate,
+	}, func(resp llm.CompletionResponse) {
+		res := api.ChatResponse{
+			Model:     req.Model,
+			CreatedAt: time.Now().UTC(),
+			Message:   api.Message{Role: "assistant", Content: resp.Content},
+			Done:      resp.Done,
+			Metrics: api.Metrics{
+				PromptEvalCount:    resp.PromptEvalCount,
+				PromptEvalDuration: resp.PromptEvalDuration,
+				EvalCount:          resp.EvalCount,
+				EvalDuration:       resp.EvalDuration,
+			},
+		}
+		
+		if resp.Done {
+			res.DoneReason = resp.DoneReason.String()
+			res.TotalDuration = time.Since(checkpointStart)
+			res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
+			result.DoneReason = res.DoneReason
+			result.Metrics = res.Metrics
+		}
+		
+		// Handle builtin parser (for models with native tool support)
+		if builtinParser != nil {
+			content, thinking, toolCalls, err := builtinParser.Add(resp.Content, resp.Done)
+			if err != nil {
+				result.Error = err
+				done <- err
+				return
+			}
+			
+			res.Message.Content = content
+			res.Message.Thinking = thinking
+			res.Message.ToolCalls = toolCalls
+			
+			thinkingBuilder.WriteString(thinking)
+			
+			// Accumulate results
+			result.Content += content
+			result.Thinking += thinking
+			if len(toolCalls) > 0 {
+				result.ToolCalls = toolCalls // Parser returns complete set
+			}
+			
+			// Stream to client if there's content to stream
+			if res.Message.Content != "" || res.Message.Thinking != "" || len(res.Message.ToolCalls) > 0 || resp.Done {
+				ch <- res
+			}
+			
+			if resp.Done {
+				result.Done = true
+				done <- nil
+			}
+			return
+		}
+		
+		// Handle thinking state parser
+		if thinkingState != nil {
+			thinkingContent, remainingContent := thinkingState.AddContent(res.Message.Content)
+			if thinkingContent == "" && remainingContent == "" && !resp.Done {
+				// Need more content to decide
+				return
+			}
+			
+			res.Message.Thinking = thinkingContent
+			thinkingBuilder.WriteString(thinkingContent)
+			res.Message.Content = remainingContent
+			result.Thinking += thinkingContent
+		}
+		
+		// Handle tool parsing (for models without native tool support)
+		if len(req.Tools) > 0 && builtinParser == nil {
+			toolCalls, content := toolParser.Add(res.Message.Content)
+			if len(content) > 0 {
+				res.Message.Content = content
+				result.Content += content
+			} else if len(toolCalls) > 0 {
+				res.Message.ToolCalls = toolCalls
+				res.Message.Content = ""
+				// Keep accumulating tool calls
+				accumulatedToolCalls = toolCalls
+			}
+		} else {
+			result.Content += res.Message.Content
+		}
+		
+		// Stream to client
+		ch <- res
+		
+		if resp.Done {
+			// If we accumulated tool calls, set them in result
+			if len(accumulatedToolCalls) > 0 {
+				result.ToolCalls = accumulatedToolCalls
+			}
+			// If no tool calls, get final content from parser
+			if len(result.ToolCalls) == 0 && toolParser != nil {
+				result.Content = toolParser.Content()
+			}
+			result.Done = true
+			done <- nil
+		}
+	})
+	
+	if err != nil {
+		return nil, err
+	}
+	
+	// Wait for completion or context cancellation
+	select {
+	case err := <-done:
+		if err != nil {
+			return nil, err
+		}
+		return result, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func (s *Server) ChatHandler(c *gin.Context) {
 	checkpointStart := time.Now()
 
@@ -1968,6 +2369,75 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		}
 	}
 
+	// Initialize or get MCP manager from global registry
+	var mcpManager *MCPManager
+	
+	// Check if we need MCP support (either MCPServers or ToolsPath)
+	if len(req.MCPServers) > 0 || req.ToolsPath != "" {
+		registry := GetMCPRegistry()
+		
+		if req.ToolsPath != "" {
+			// Interactive mode with --tools flag
+			slog.Debug("Using tools path for MCP manager", "tools_path", req.ToolsPath, "model", req.Model)
+			mcpManager, err = registry.GetManagerForToolsPath(req.Model, req.ToolsPath)
+			if err != nil {
+				slog.Error("Failed to get MCP manager for tools path", "error", err)
+				// Continue without MCP
+			}
+		} else if len(req.MCPServers) > 0 {
+			// Explicit MCP servers configuration
+			sessionID := GenerateSessionID(req)
+			slog.Debug("Getting MCP manager", "session", sessionID, "servers", len(req.MCPServers))
+			mcpManager, err = registry.GetOrCreateManager(sessionID, req.MCPServers)
+			if err != nil {
+				slog.Error("Failed to get MCP manager", "error", err)
+				// Continue without MCP
+			}
+		}
+		
+		if mcpManager != nil {
+			// Add MCP tools to the existing tools
+			mcpTools := mcpManager.GetAllTools()
+			req.Tools = append(req.Tools, mcpTools...)
+			
+			// Inject MCP context for better tool usage
+			if len(req.MCPServers) > 0 {
+				codeAPI := NewMCPCodeAPI(mcpManager)
+				req.Messages = codeAPI.InjectContextIntoMessages(req.Messages, req.MCPServers)
+			} else if req.ToolsPath != "" {
+				// Create simple context for tools path
+				contextMsg := fmt.Sprintf("\n=== Tool Context ===\nFile system tools are available for path: %s\n", req.ToolsPath)
+				if len(req.Messages) > 0 && req.Messages[0].Role == "system" {
+					req.Messages[0].Content = req.Messages[0].Content + "\n" + contextMsg
+				} else {
+					req.Messages = append([]api.Message{{
+						Role:    "system",
+						Content: contextMsg,
+					}}, req.Messages...)
+				}
+			}
+			
+			// Auto-configure parser for tools if needed (after MCP tools are added)
+			if len(req.Tools) > 0 && m.Config.Parser == "" {
+				if m.Config.ModelFamily == "qwen2" || m.Config.ModelFamily == "qwen3" {
+					m.Config.Parser = "qwen3-vl-instruct"
+				}
+			}
+			
+			// Update capabilities if we now have tools
+			if len(req.Tools) > 0 && !slices.Contains(caps, model.CapabilityTools) {
+				caps = append(caps, model.CapabilityTools)
+			}
+		}
+		
+		// Note: We do NOT cleanup MCP manager here - it's managed by the registry
+		defer func() {
+			if err := mcpManager.Close(); err != nil {
+				slog.Warn("Error closing MCP manager", "error", err)
+			}
+		}()
+	}
+
 	r, m, opts, err := s.scheduleRunner(c.Request.Context(), name.String(), caps, req.Options, req.KeepAlive)
 	if errors.Is(err, errCapabilityCompletion) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("%q does not support chat", req.Model)})
@@ -2056,11 +2526,6 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		}
 	}
 
-	var toolParser *tools.Parser
-	if len(req.Tools) > 0 && (builtinParser == nil || !builtinParser.HasToolSupport()) {
-		toolParser = tools.NewParser(m.Template.Template, req.Tools)
-	}
-
 	type structuredOutputsState int
 	const (
 		structuredOutputsState_None structuredOutputsState = iota
@@ -2072,163 +2537,151 @@ func (s *Server) ChatHandler(c *gin.Context) {
 	go func() {
 		defer close(ch)
 
-		structuredOutputsState := structuredOutputsState_None
-
-		for {
-			var tb strings.Builder
-
-			currentFormat := req.Format
-			// structured outputs via double request is enabled when:
-			// 1. the model supports the thinking capability and
-			// 2. it uses a built-in parser or our generic thinking parser
-
-			// Note that the current approach does not work for (potential future)
-			// non-thinking models that emit anything before actual content. This
-			// current approach uses the transition from parsed thinking content to
-			// parsed non-thinking content as the signal to turn constraining on
-
-			if req.Format != nil && structuredOutputsState == structuredOutputsState_None && ((builtinParser != nil || thinkingState != nil) && slices.Contains(m.Capabilities(), model.CapabilityThinking)) {
-				currentFormat = nil
-			}
-
-			// sets up new context given parent context per request
-			ctx, cancel := context.WithCancel(c.Request.Context())
-			err := r.Completion(ctx, llm.CompletionRequest{
-				Prompt:   prompt,
-				Images:   images,
-				Format:   currentFormat,
-				Options:  opts,
-				Shift:    req.Shift == nil || *req.Shift,
-				Truncate: truncate,
-			}, func(r llm.CompletionResponse) {
-				res := api.ChatResponse{
-					Model:     req.Model,
-					CreatedAt: time.Now().UTC(),
-					Message:   api.Message{Role: "assistant", Content: r.Content},
-					Done:      r.Done,
-					Metrics: api.Metrics{
-						PromptEvalCount:    r.PromptEvalCount,
-						PromptEvalDuration: r.PromptEvalDuration,
-						EvalCount:          r.EvalCount,
-						EvalDuration:       r.EvalDuration,
-					},
-				}
-				if r.Done {
-					res.DoneReason = r.DoneReason.String()
-					res.TotalDuration = time.Since(checkpointStart)
-					res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
-				}
-
-				if builtinParser != nil {
-					slog.Log(context.TODO(), logutil.LevelTrace, "builtin parser input", "parser", m.Config.Parser, "content", r.Content)
-
-					content, thinking, toolCalls, err := builtinParser.Add(r.Content, r.Done)
-					if err != nil {
-						ch <- gin.H{"error": err.Error()}
-						return
-					}
-
-					res.Message.Content = content
-					res.Message.Thinking = thinking
-					res.Message.ToolCalls = toolCalls
-
-					tb.WriteString(thinking)
-					// we are now receiving content from the model - we should start applying structured outputs
-					if structuredOutputsState == structuredOutputsState_None && req.Format != nil && tb.String() != "" && res.Message.Content != "" {
-						structuredOutputsState = structuredOutputsState_ReadyToApply
-						cancel()
-						return
-					}
-
-					if res.Message.Content != "" || res.Message.Thinking != "" || len(res.Message.ToolCalls) > 0 || r.Done {
-						slog.Log(context.TODO(), logutil.LevelTrace, "builtin parser output", "parser", m.Config.Parser, "content", content, "thinking", thinking, "toolCalls", toolCalls, "done", r.Done)
-						ch <- res
-					} else {
-						slog.Log(context.TODO(), logutil.LevelTrace, "builtin parser empty output", "parser", m.Config.Parser)
-					}
-					return
-				}
-
-				if thinkingState != nil {
-					thinkingContent, remainingContent := thinkingState.AddContent(res.Message.Content)
-					if thinkingContent == "" && remainingContent == "" && !r.Done {
-						// need to accumulate more to decide what to send
-						return
-					}
-					res.Message.Thinking = thinkingContent
-					tb.WriteString(thinkingContent)
-					// emit the collected thinking text before restarting with structured outputs and clear unstructured content
-					// to avoid leaking mixed tokens like "</think>Hello"
-					if structuredOutputsState == structuredOutputsState_None && req.Format != nil && tb.String() != "" && remainingContent != "" {
-						structuredOutputsState = structuredOutputsState_ReadyToApply
-						res.Message.Content = ""
-						ch <- res
-						cancel()
-						return
-					}
-					res.Message.Content = remainingContent
-				}
-
-				if len(req.Tools) > 0 {
-					toolCalls, content := toolParser.Add(res.Message.Content)
-					if len(content) > 0 {
-						res.Message.Content = content
-					} else if len(toolCalls) > 0 {
-						res.Message.ToolCalls = toolCalls
-						res.Message.Content = ""
-					} else if res.Message.Thinking != "" {
-						// don't return
-					} else {
-						if r.Done {
-							res.Message.Content = toolParser.Content()
-							ch <- res
-						}
-						return
-					}
-				}
-
-				ch <- res
-			})
-			if err != nil {
-				if structuredOutputsState == structuredOutputsState_ReadyToApply && strings.Contains(err.Error(), "context canceled") && c.Request.Context().Err() == nil {
-					// only ignores error if it's a context cancellation due to setting structured outputs
-				} else {
-					var serr api.StatusError
-					if errors.As(err, &serr) {
-						ch <- gin.H{"error": serr.ErrorMessage, "status": serr.StatusCode}
-					} else {
-						ch <- gin.H{"error": err.Error()}
-					}
-					return
-				}
-			}
-
-			// ignored structured outputs cancellation falls through to here, start a new request with the structured outputs and updated prompt. use the
-			if structuredOutputsState == structuredOutputsState_ReadyToApply {
-				structuredOutputsState = structuredOutputsState_Applying
-				msg := api.Message{
-					Role:     "assistant",
-					Thinking: tb.String(),
-				}
-
-				msgs = append(msgs, msg)
-				prompt, _, err = chatPrompt(c.Request.Context(), m, r.Tokenize, opts, msgs, processedTools, req.Think, truncate)
+		// Initialize for multi-round execution
+		currentMsgs := msgs
+		maxRounds := req.MaxToolRounds
+		if maxRounds == 0 {
+			maxRounds = 15 // Default maximum rounds
+		}
+		
+		slog.Debug("Starting multi-round execution", 
+			"mcpManager", mcpManager != nil,
+			"tools_count", len(req.Tools),
+			"max_rounds", maxRounds)
+		
+		// MAIN REFACTORED LOOP - Clean single loop for multi-round execution
+		var round int
+		for round = 0; round < maxRounds; round++ {
+			slog.Debug("Starting round", "round", round, "messages", len(currentMsgs))
+			
+			// Re-render prompt if not first round (tool results were added)
+			if round > 0 {
+				var err error
+				prompt, images, err = chatPrompt(c.Request.Context(), m, r.Tokenize, opts, currentMsgs, processedTools, req.Think, truncate)
 				if err != nil {
-					slog.Error("chat prompt error applying structured outputs", "error", err)
+					slog.Error("Failed to render prompt in round", "round", round, "error", err)
 					ch <- gin.H{"error": err.Error()}
 					return
 				}
-				// force constraining by terminating thinking header, the parser is already at this state
-				// when the last message is thinking, the rendered for gpt-oss cannot disambiguate between having the
-				// model continue thinking or ending thinking and outputting the final message.
-				// TODO(parthsareen): consider adding prefill disambiguation logic to the renderer for structured outputs.
-				if shouldUseHarmony(m) || (builtinParser != nil && m.Config.Parser == "harmony") {
-					prompt += "<|end|><|start|>assistant<|channel|>final<|message|>"
-				}
-				continue
 			}
-
-			break
+			
+			// Execute completion and collect full response
+			completionResult, err := s.executeCompletionWithTools(
+				c.Request.Context(),
+				r,
+				prompt,
+				images,
+				opts,
+				req,
+				m,
+				builtinParser,
+				thinkingState,
+				ch,
+				checkpointStart,
+				checkpointLoaded,
+				truncate,
+			)
+			
+			if err != nil {
+				slog.Error("Completion failed", "round", round, "error", err)
+				var serr api.StatusError
+				if errors.As(err, &serr) {
+					ch <- gin.H{"error": serr.ErrorMessage, "status": serr.StatusCode}
+				} else {
+					ch <- gin.H{"error": err.Error()}
+				}
+				return
+			}
+			
+			// Check if model called tools
+			if len(completionResult.ToolCalls) == 0 {
+				// No tools called - conversation is complete
+				slog.Debug("No tools called, conversation complete", "round", round)
+				break // Exit the loop - we're done
+			}
+			
+			// Validate tool calls are not empty or malformed
+			validToolCalls := 0
+			for _, tc := range completionResult.ToolCalls {
+				if tc.Function.Name != "" {
+					validToolCalls++
+				} else {
+					slog.Warn("Invalid tool call detected", "round", round, "tool", tc)
+				}
+			}
+			
+			if validToolCalls == 0 {
+				slog.Warn("No valid tool calls found, exiting", "round", round)
+				break
+			}
+			
+			// Model called tools - execute them if we have an MCP manager
+			if mcpManager != nil {
+				slog.Info("Executing tools via MCP", 
+					"count", len(completionResult.ToolCalls), 
+					"round", round)
+				
+				// Analyze execution plan
+				executionPlan := mcpManager.AnalyzeExecutionPlan(completionResult.ToolCalls)
+				slog.Debug("Execution plan determined",
+					"sequential", executionPlan.RequiresSequential,
+					"reason", executionPlan.Reason)
+				
+				// Execute tools according to plan
+				results := mcpManager.ExecuteWithPlan(completionResult.ToolCalls, executionPlan)
+				
+				// Log tool calls for debugging
+				for i, tc := range completionResult.ToolCalls {
+					slog.Info("Tool call details", 
+						"round", round,
+						"index", i,
+						"name", tc.Function.Name,
+						"arguments", tc.Function.Arguments)
+				}
+				
+				// Add assistant message with tool calls
+				assistantMsg := api.Message{
+					Role:      "assistant",
+					Content:   completionResult.Content, // Preserve any content
+					ToolCalls: completionResult.ToolCalls,
+				}
+				currentMsgs = append(currentMsgs, assistantMsg)
+				
+				// Add tool result messages
+				for i, result := range results {
+					toolMsg := api.Message{
+						Role:     "tool",
+						ToolName: completionResult.ToolCalls[i].Function.Name,
+					}
+					
+					if result.Error != nil {
+						toolMsg.Content = fmt.Sprintf("Error: %v", result.Error)
+						slog.Warn("Tool execution failed", 
+							"tool", completionResult.ToolCalls[i].Function.Name, 
+							"error", result.Error)
+					} else {
+						toolMsg.Content = result.Content
+					}
+					
+					currentMsgs = append(currentMsgs, toolMsg)
+				}
+				
+				// Continue to next round - model will process tool results
+				slog.Debug("Tools executed, continuing to next round", 
+					"round", round, 
+					"messages", len(currentMsgs))
+				
+			} else {
+				// No MCP manager - send tool calls to client for external execution
+				slog.Debug("No MCP manager, sending tool calls to client", "round", round)
+				break // Exit - client will handle tool execution
+			}
+		} // End of maxRounds loop
+		
+		// Check if we exhausted rounds
+		if round >= maxRounds {
+			slog.Warn("Maximum tool execution rounds reached", "rounds", maxRounds)
+			ch <- gin.H{"error": fmt.Sprintf("Maximum tool execution rounds (%d) exceeded", maxRounds)}
 		}
 	}()
 
@@ -2249,34 +2702,24 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			case gin.H:
 				msg, ok := t["error"].(string)
 				if !ok {
-					msg = "unexpected error format in response"
+					msg = "unexpected error"
 				}
-
-				status, ok := t["status"].(int)
-				if !ok {
-					status = http.StatusInternalServerError
-				}
-
-				c.JSON(status, gin.H{"error": msg})
+				c.JSON(http.StatusBadRequest, gin.H{"error": msg})
 				return
 			default:
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "unexpected response"})
 				return
 			}
 		}
-
 		resp.Message.Content = sbContent.String()
 		resp.Message.Thinking = sbThinking.String()
-
-		if len(toolCalls) > 0 {
+		if len(req.Tools) > 0 {
 			resp.Message.ToolCalls = toolCalls
 		}
-
 		c.JSON(http.StatusOK, resp)
-		return
+	} else {
+		streamResponse(c, ch)
 	}
-
-	streamResponse(c, ch)
 }
 
 func handleScheduleError(c *gin.Context, name string, err error) {

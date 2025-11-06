@@ -22,6 +22,9 @@ const (
 
 const (
 	thinkingCloseTag = "</think>"
+	// JSON tool call patterns
+	jsonToolStart = `{"name"`
+	jsonToolEnd   = `}`
 )
 
 type Qwen3VLParser struct {
@@ -29,6 +32,7 @@ type Qwen3VLParser struct {
 	buffer             strings.Builder
 	tools              []api.Tool
 	hasThinkingSupport bool
+	processedToolCalls []api.ToolCall // Track tool calls found during streaming
 }
 
 func (p *Qwen3VLParser) HasToolSupport() bool {
@@ -57,6 +61,10 @@ func (p *Qwen3VLParser) setInitialState(lastMessage *api.Message) {
 func (p *Qwen3VLParser) Init(tools []api.Tool, lastMessage *api.Message) []api.Tool {
 	p.tools = tools
 	p.setInitialState(lastMessage)
+	// Reset accumulated tool calls to prevent memory leak across requests
+	p.processedToolCalls = nil
+	// Reset buffer to ensure clean state
+	p.buffer.Reset()
 	return tools
 }
 
@@ -68,9 +76,12 @@ func (qwenEventThinkingContent) isQwenEvent() {}
 
 func (p *Qwen3VLParser) Add(s string, done bool) (content string, thinking string, calls []api.ToolCall, err error) {
 	p.buffer.WriteString(s)
+	
+	// Debug logging removed
+	
 	events := p.parseEvents()
 
-	var toolCalls []api.ToolCall
+	var currentToolCalls []api.ToolCall
 	var contentSb strings.Builder
 	var thinkingSb strings.Builder
 	for _, event := range events {
@@ -81,7 +92,9 @@ func (p *Qwen3VLParser) Add(s string, done bool) (content string, thinking strin
 				slog.Warn("qwen tool call parsing failed", "error", err)
 				return "", "", nil, err
 			}
-			toolCalls = append(toolCalls, toolCall)
+			currentToolCalls = append(currentToolCalls, toolCall)
+			// Store tool calls for final return when done=true
+			p.processedToolCalls = append(p.processedToolCalls, toolCall)
 		case qwenEventThinkingContent:
 			thinkingSb.WriteString(event.content)
 		case qwenEventContent:
@@ -91,7 +104,15 @@ func (p *Qwen3VLParser) Add(s string, done bool) (content string, thinking strin
 		}
 	}
 
-	return contentSb.String(), thinkingSb.String(), toolCalls, nil
+	// When done=true, return all accumulated tool calls
+	if done && len(p.processedToolCalls) > 0 {
+		allToolCalls := p.processedToolCalls
+		p.processedToolCalls = nil // Reset for next use
+		// Debug logging removed
+		return contentSb.String(), thinkingSb.String(), allToolCalls, nil
+	}
+
+	return contentSb.String(), thinkingSb.String(), currentToolCalls, nil
 }
 
 func (p *Qwen3VLParser) parseEvents() []qwenEvent {
@@ -142,28 +163,69 @@ func (p *Qwen3VLParser) eat() ([]qwenEvent, bool) {
 
 	switch p.state {
 	case CollectingContent:
-		if strings.Contains(p.buffer.String(), toolOpenTag) {
-			// events = emitContentBeforeTag(p, events, toolOpenTag)
-			before, _ := splitAtTag(p, toolOpenTag, false)
-			if len(before) > 0 {
-				events = append(events, qwenEventContent{content: before})
+		bufferContent := p.buffer.String()
+		
+		// Look for XML-wrapped JSON tool calls: <tool_call>{"name": ...}</tool_call>
+		if xmlStart := strings.Index(bufferContent, "<tool_call>"); xmlStart != -1 {
+			before := bufferContent[:xmlStart]
+			remaining := bufferContent[xmlStart:]
+			
+			if xmlEnd := strings.Index(remaining, "</tool_call>"); xmlEnd != -1 {
+				// Complete XML-wrapped tool call found
+				if len(before) > 0 {
+					events = append(events, qwenEventContent{content: before})
+				}
+				
+				// Extract JSON content between XML tags
+				xmlStartLen := len("<tool_call>")
+				jsonContent := remaining[xmlStartLen:xmlEnd]
+				jsonContent = strings.TrimSpace(jsonContent)
+				
+				after := remaining[xmlEnd+len("</tool_call>"):]
+				
+				events = append(events, qwenEventRawToolCall{raw: jsonContent})
+				p.buffer.Reset()
+				p.buffer.WriteString(after)
+				return events, true
+			} else {
+				// Incomplete XML wrapper, emit content before XML start and keep XML part
+				if len(before) > 0 {
+					events = append(events, qwenEventContent{content: before})
+				}
+				p.buffer.Reset()
+				p.buffer.WriteString(remaining)
+				return events, false
 			}
-			p.state = CollectingToolContent
-			return events, true
-		} else if overlapLen := overlap(p.buffer.String(), toolOpenTag); overlapLen > 0 {
-			beforePartialTag := p.buffer.String()[:len(p.buffer.String())-overlapLen]
-			trailingWhitespaceLen := trailingWhitespaceLen(beforePartialTag)
-			ambiguousStart := len(beforePartialTag) - trailingWhitespaceLen
-
-			unambiguous := p.buffer.String()[:ambiguousStart]
-			ambiguous := p.buffer.String()[ambiguousStart:]
-			p.buffer.Reset()
-			p.buffer.WriteString(ambiguous)
-			if len(unambiguous) > 0 {
-				events = append(events, qwenEventContent{content: unambiguous})
+		} else if jsonStart := strings.Index(bufferContent, jsonToolStart); jsonStart != -1 {
+			// Look for direct JSON tool call pattern: {"name": "...", "arguments": {...}}
+			before := bufferContent[:jsonStart]
+			remaining := bufferContent[jsonStart:]
+			
+			// Find the end of the JSON object by counting braces
+			if jsonEnd := findJSONObjectEnd(remaining); jsonEnd != -1 {
+				// Complete JSON object found
+				if len(before) > 0 {
+					events = append(events, qwenEventContent{content: before})
+				}
+				
+				jsonToolCall := remaining[:jsonEnd+1]
+				after := remaining[jsonEnd+1:]
+				
+				events = append(events, qwenEventRawToolCall{raw: jsonToolCall})
+				p.buffer.Reset()
+				p.buffer.WriteString(after)
+				return events, true
+			} else {
+				// Incomplete JSON object, emit content before JSON start and keep JSON part
+				if len(before) > 0 {
+					events = append(events, qwenEventContent{content: before})
+				}
+				p.buffer.Reset()
+				p.buffer.WriteString(remaining)
+				return events, false
 			}
-			return events, false
 		} else {
+			// No tool call found, emit all content except trailing whitespace
 			whitespaceLen := trailingWhitespaceLen(p.buffer.String())
 			ambiguousStart := len(p.buffer.String()) - whitespaceLen
 
@@ -177,22 +239,10 @@ func (p *Qwen3VLParser) eat() ([]qwenEvent, bool) {
 			return events, false
 		}
 	case CollectingToolContent:
-		if strings.Contains(p.buffer.String(), toolCloseTag) {
-			split := strings.SplitN(p.buffer.String(), toolCloseTag, 2)
-			before := split[0] // do we also need to do it to tool calls?
-			if len(before) == 0 {
-				slog.Warn("qwen tool call closing tag found but no content before it")
-			}
-
-			after := split[1]
-			events = append(events, qwenEventRawToolCall{raw: before})
-			p.buffer.Reset()
-			p.buffer.WriteString(after)
-			p.state = ToolCallDoneEatingWhitespace
-			return events, true
-		} else {
-			return events, false
-		}
+		// This state is not used for JSON parsing since JSON objects are parsed completely
+		// Fallback to CollectingContent
+		p.state = CollectingContent
+		return nil, true
 	case CollectingThinkingContent:
 		if strings.Contains(p.buffer.String(), thinkingCloseTag) {
 			thinking, remaining := splitAtTag(p, thinkingCloseTag, true)
@@ -250,4 +300,42 @@ func parseJSONToolCall(raw qwenEventRawToolCall, tools []api.Tool) (api.ToolCall
 	toolCall.Function = toolCallFunction
 
 	return toolCall, nil
+}
+
+// findJSONObjectEnd finds the end of a JSON object by counting braces
+// Returns the index of the closing brace, or -1 if not found
+func findJSONObjectEnd(s string) int {
+	braceCount := 0
+	inString := false
+	escaped := false
+	
+	for i, char := range s {
+		if escaped {
+			escaped = false
+			continue
+		}
+		
+		if char == '\\' {
+			escaped = true
+			continue
+		}
+		
+		if char == '"' {
+			inString = !inString
+			continue
+		}
+		
+		if !inString {
+			if char == '{' {
+				braceCount++
+			} else if char == '}' {
+				braceCount--
+				if braceCount == 0 {
+					return i
+				}
+			}
+		}
+	}
+	
+	return -1 // No complete JSON object found
 }

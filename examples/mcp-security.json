@@ -1,0 +1,32 @@
+{
+  "comment": "Example MCP security configuration - customize for your environment",
+  
+  "blocked_commands": [
+    "Additional commands to block beyond defaults",
+    "custom_dangerous_command"
+  ],
+  
+  "blocked_metacharacters": [
+    "Additional metacharacters to block if needed"
+  ],
+  
+  "filtered_environment_vars": [
+    "MY_COMPANY_SECRET",
+    "CUSTOM_API_TOKEN"
+  ],
+  
+  "filtered_environment_patterns": [
+    "*_INTERNAL",
+    "COMPANY_*"
+  ],
+  
+  "allowed_commands": [
+    "Comment: Use this in strict_mode to whitelist specific commands",
+    "python3",
+    "node",
+    "my_safe_tool"
+  ],
+  
+  "strict_mode": false,
+  "strict_mode_comment": "Set to true to only allow explicitly listed commands in allowed_commands"
+}

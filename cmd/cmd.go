@@ -378,6 +378,65 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 		opts.KeepAlive = &api.Duration{Duration: d}
 	}
 
+	toolsSpec, err := cmd.Flags().GetString("tools")
+	if err != nil {
+		return err
+	}
+	if toolsSpec != "" {
+		// Parse tools specification: "type:path" or just "path" for filesystem
+		parts := strings.SplitN(toolsSpec, ":", 2)
+		serverType := "filesystem"
+		path := toolsSpec
+		
+		if len(parts) == 2 {
+			serverType = parts[0]
+			path = parts[1]
+		}
+		
+		// For backward compatibility, treat plain paths as filesystem
+		if !strings.Contains(toolsSpec, ":") && strings.HasPrefix(toolsSpec, "/") {
+			serverType = "filesystem"
+			path = toolsSpec
+		}
+		
+		// Create MCP server config based on type
+		switch serverType {
+		case "filesystem", "fs":
+			opts.MCPServers = []api.MCPServerConfig{
+				{
+					Name:    "filesystem",
+					Command: "npx",
+					Args:    []string{"@modelcontextprotocol/server-filesystem", path},
+				},
+			}
+		case "git":
+			opts.MCPServers = []api.MCPServerConfig{
+				{
+					Name:    "git",
+					Command: "npx",
+					Args:    []string{"@modelcontextprotocol/server-git", path},
+				},
+			}
+		case "python":
+			opts.MCPServers = []api.MCPServerConfig{
+				{
+					Name:    "python",
+					Command: "python",
+					Args:    []string{"-m", "mcp_server_python"},
+				},
+			}
+		default:
+			// Try to use as a raw MCP server command
+			opts.MCPServers = []api.MCPServerConfig{
+				{
+					Name:    serverType,
+					Command: serverType,
+					Args:    strings.Fields(path),
+				},
+			}
+		}
+	}
+
 	prompts := args[1:]
 	// prepend stdin to the prompt if provided
 	if !term.IsTerminal(int(os.Stdin.Fd())) {
@@ -1121,6 +1180,7 @@ type runOptions struct {
 	Think        *api.ThinkValue
 	HideThinking bool
 	ShowConnect  bool
+	MCPServers   []api.MCPServerConfig
 }
 
 func (r runOptions) Copy() runOptions {
@@ -1150,6 +1210,12 @@ func (r runOptions) Copy() runOptions {
 		think = &cThink
 	}
 
+	var mcpServers []api.MCPServerConfig
+	if r.MCPServers != nil {
+		mcpServers = make([]api.MCPServerConfig, len(r.MCPServers))
+		copy(mcpServers, r.MCPServers)
+	}
+
 	return runOptions{
 		Model:        r.Model,
 		ParentModel:  r.ParentModel,
@@ -1165,6 +1231,7 @@ func (r runOptions) Copy() runOptions {
 		Think:        think,
 		HideThinking: r.HideThinking,
 		ShowConnect:  r.ShowConnect,
+		MCPServers:   mcpServers,
 	}
 }
 
@@ -1271,6 +1338,7 @@ func chat(cmd *cobra.Command, opts runOptions) (*api.Message, error) {
 	var fullResponse strings.Builder
 	var thinkTagOpened bool = false
 	var thinkTagClosed bool = false
+	var toolCallsDisplayed bool = false
 
 	role := "assistant"
 
@@ -1310,8 +1378,16 @@ func chat(cmd *cobra.Command, opts runOptions) (*api.Message, error) {
 
 		if response.Message.ToolCalls != nil {
 			toolCalls := response.Message.ToolCalls
-			if len(toolCalls) > 0 {
+			if len(toolCalls) > 0 && !toolCallsDisplayed {
 				fmt.Print(renderToolCalls(toolCalls, false))
+				toolCallsDisplayed = true
+			}
+		}
+		
+		if response.Message.ToolResults != nil {
+			toolResults := response.Message.ToolResults
+			if len(toolResults) > 0 {
+				fmt.Print(renderToolResults(toolResults, false))
 			}
 		}
 
@@ -1325,11 +1401,12 @@ func chat(cmd *cobra.Command, opts runOptions) (*api.Message, error) {
 	}
 
 	req := &api.ChatRequest{
-		Model:    opts.Model,
-		Messages: opts.Messages,
-		Format:   json.RawMessage(opts.Format),
-		Options:  opts.Options,
-		Think:    opts.Think,
+		Model:      opts.Model,
+		Messages:   opts.Messages,
+		Format:     json.RawMessage(opts.Format),
+		Options:    opts.Options,
+		Think:      opts.Think,
+		MCPServers: opts.MCPServers,
 	}
 
 	if opts.KeepAlive != nil {
@@ -1402,6 +1479,7 @@ func generate(cmd *cobra.Command, opts runOptions) error {
 	var thinkingContent strings.Builder
 	var thinkTagOpened bool = false
 	var thinkTagClosed bool = false
+	var toolCallsDisplayed bool = false
 
 	plainText := !term.IsTerminal(int(os.Stdout.Fd()))
 
@@ -1437,8 +1515,16 @@ func generate(cmd *cobra.Command, opts runOptions) error {
 
 		if response.ToolCalls != nil {
 			toolCalls := response.ToolCalls
-			if len(toolCalls) > 0 {
+			if len(toolCalls) > 0 && !toolCallsDisplayed {
 				fmt.Print(renderToolCalls(toolCalls, plainText))
+				toolCallsDisplayed = true
+			}
+		}
+		
+		if response.ToolResults != nil {
+			toolResults := response.ToolResults
+			if len(toolResults) > 0 {
+				fmt.Print(renderToolResults(toolResults, plainText))
 			}
 		}
 
@@ -1457,15 +1543,16 @@ func generate(cmd *cobra.Command, opts runOptions) error {
 	}
 
 	request := api.GenerateRequest{
-		Model:     opts.Model,
-		Prompt:    opts.Prompt,
-		Context:   generateContext,
-		Images:    opts.Images,
-		Format:    json.RawMessage(opts.Format),
-		System:    opts.System,
-		Options:   opts.Options,
-		KeepAlive: opts.KeepAlive,
-		Think:     opts.Think,
+		Model:      opts.Model,
+		Prompt:     opts.Prompt,
+		Context:    generateContext,
+		Images:     opts.Images,
+		Format:     json.RawMessage(opts.Format),
+		System:     opts.System,
+		Options:    opts.Options,
+		KeepAlive:  opts.KeepAlive,
+		Think:      opts.Think,
+		MCPServers: opts.MCPServers,
 	}
 
 	if err := client.Generate(ctx, &request, fn); err != nil {
@@ -1684,6 +1771,7 @@ func NewCLI() *cobra.Command {
 	runCmd.Flags().String("think", "", "Enable thinking mode: true/false or high/medium/low for supported models")
 	runCmd.Flags().Lookup("think").NoOptDefVal = "true"
 	runCmd.Flags().Bool("hidethinking", false, "Hide thinking output (if provided)")
+	runCmd.Flags().String("tools", "", "Enable MCP tools (filesystem:/path, git:/repo, python, or custom:args)")
 
 	stopCmd := &cobra.Command{
 		Use:     "stop MODEL",
@@ -1901,8 +1989,33 @@ func renderToolCalls(toolCalls []api.ToolCall, plainText bool) string {
 		if i > 0 {
 			out += "\n"
 		}
-		// all tool calls are unexpected since we don't currently support registering any in the CLI
-		out += fmt.Sprintf("  Model called a non-existent function '%s()' with arguments: %s", formatValues+toolCall.Function.Name+formatExplanation, formatValues+string(argsAsJSON)+formatExplanation)
+		// Show tool execution in progress
+		out += fmt.Sprintf("  🔧 Executing tool '%s' with arguments: %s", formatValues+toolCall.Function.Name+formatExplanation, formatValues+string(argsAsJSON)+formatExplanation)
+	}
+	if !plainText {
+		out += readline.ColorDefault
+	}
+	return out
+}
+
+func renderToolResults(toolResults []api.ToolResult, plainText bool) string {
+	out := ""
+	formatExplanation := ""
+	formatValues := ""
+	if !plainText {
+		formatExplanation = readline.ColorGrey + readline.ColorBold
+		formatValues = readline.ColorDefault
+		out += formatExplanation
+	}
+	for i, toolResult := range toolResults {
+		if i > 0 {
+			out += "\n"
+		}
+		if toolResult.Error != "" {
+			out += fmt.Sprintf("  ❌ Tool '%s' failed: %s", formatValues+toolResult.ToolName+formatExplanation, formatValues+toolResult.Error+formatExplanation)
+		} else {
+			out += fmt.Sprintf("  ✅ Tool '%s' result: %s", formatValues+toolResult.ToolName+formatExplanation, formatValues+toolResult.Content+formatExplanation)
+		}
 	}
 	if !plainText {
 		out += readline.ColorDefault
