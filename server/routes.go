@@ -651,27 +651,23 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 								ch <- toolResultResponse
 								
 								// Build new prompt with tool results for next round
+								// Instead of appending raw tool calls, create a cleaner prompt
 								var promptBuilder strings.Builder
 								promptBuilder.WriteString(currentPrompt)
-								promptBuilder.WriteString("\n\nAssistant: ")
+								promptBuilder.WriteString("\n\nAssistant: I'll help you with that. Let me use the available tools.\n\n")
 								
-								// Add tool calls to prompt
-								for _, call := range toolCalls {
-									promptBuilder.WriteString(fmt.Sprintf("<tool_call>{\"name\": \"%s\", \"arguments\": %s}</tool_call>\n", call.Function.Name, call.Function.Arguments))
-								}
-								
-								// Add tool results to prompt
+								// Add tool results in a clean format without showing the raw JSON calls
+								promptBuilder.WriteString("Here are the tool results:\n\n")
 								for i, result := range results {
-									promptBuilder.WriteString(fmt.Sprintf("<tool_result name=\"%s\">", toolCalls[i].Function.Name))
+									promptBuilder.WriteString(fmt.Sprintf("Tool: %s\n", toolCalls[i].Function.Name))
 									if result.Error != nil {
-													promptBuilder.WriteString(fmt.Sprintf("Error: %v", result.Error))
+										promptBuilder.WriteString(fmt.Sprintf("Result: Error - %v\n\n", result.Error))
 									} else {
-													promptBuilder.WriteString(result.Content)
+										promptBuilder.WriteString(fmt.Sprintf("Result: %s\n\n", result.Content))
 									}
-									promptBuilder.WriteString("</tool_result>\n")
 								}
 								
-								promptBuilder.WriteString("\nHuman: Please interpret the tool results and provide a response.\n\nAssistant:")
+								promptBuilder.WriteString("Based on these results, ")
 								currentPrompt = promptBuilder.String()
 								
 								// Signal that we need to continue to next round
@@ -2688,9 +2684,10 @@ func (s *Server) ChatHandler(c *gin.Context) {
 				}
 				
 				// Continue to next round - model will process tool results
-				slog.Debug("Tools executed, continuing to next round", 
+				slog.Info("Tools executed, continuing to next round", 
 					"round", round, 
-					"messages", len(currentMsgs))
+					"messages", len(currentMsgs),
+					"last_tool", completionResult.ToolCalls[len(completionResult.ToolCalls)-1].Function.Name)
 				
 			} else {
 				// No MCP manager - send tool calls to client for external execution

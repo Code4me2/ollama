@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"regexp"
 	"strings"
 	"unicode"
 
@@ -375,7 +376,28 @@ func min(a, b int) int {
 
 // fixIncompleteJSON attempts to fix incomplete JSON by adding missing closing braces
 func fixIncompleteJSON(jsonStr string) string {
-	// First, normalize whitespace - replace newlines and excessive spaces
+	// First, clean up control tokens that might have leaked into the JSON
+	// These are Qwen-specific ChatML tokens that sometimes appear in tool calls
+	jsonStr = strings.ReplaceAll(jsonStr, "<|im_start|>", "")
+	jsonStr = strings.ReplaceAll(jsonStr, "<|im_end|>", "")
+	jsonStr = strings.ReplaceAll(jsonStr, "<|endoftext|>", "")
+	jsonStr = strings.ReplaceAll(jsonStr, "<|fim_prefix|>", "")
+	jsonStr = strings.ReplaceAll(jsonStr, "<|fim_suffix|>", "")
+	jsonStr = strings.ReplaceAll(jsonStr, "<|fim_middle|>", "")
+	
+	// Remove any other control tokens that might appear (format: <|...|>)
+	// This regex removes any token matching <|...|> pattern
+	re := regexp.MustCompile(`<\|[^|]+\|>`)
+	jsonStr = re.ReplaceAllString(jsonStr, "")
+	
+	// Remove any garbage text before the actual JSON starts
+	// Look for the start of JSON (either { or [)
+	if idx := strings.Index(jsonStr, "{"); idx > 0 {
+		// There's content before the JSON object, remove it
+		jsonStr = jsonStr[idx:]
+	}
+	
+	// Now normalize whitespace - replace newlines and excessive spaces
 	jsonStr = strings.ReplaceAll(jsonStr, "\n", " ")
 	jsonStr = strings.ReplaceAll(jsonStr, "\r", " ")
 	jsonStr = strings.TrimSpace(jsonStr)

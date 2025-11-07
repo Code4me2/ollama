@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -48,6 +49,13 @@ import (
 )
 
 const ConnectInstructions = "To sign in, navigate to:\n    %s\n\n"
+
+// Tool detection and buffering configuration
+const (
+	DefaultToolBufferDelay = 500 * time.Millisecond
+	MinToolBufferDelay     = 100 * time.Millisecond
+	MaxToolBufferDelay     = 2 * time.Second
+)
 
 // ensureThinkingSupport emits a warning if the model does not advertise thinking support
 func ensureThinkingSupport(ctx context.Context, client *api.Client, name string) {
@@ -1240,6 +1248,184 @@ type displayResponseState struct {
 	wordBuffer string
 }
 
+// StreamingToolDetector maintains state for detecting tool calls across streaming chunks
+type StreamingToolDetector struct {
+	inXMLToolCall  bool
+	xmlStartBuffer strings.Builder
+	inJSONToolCall bool
+	jsonBuffer     strings.Builder
+	jsonDepth      int
+	inString       bool
+	escapeNext     bool
+}
+
+// NewStreamingToolDetector creates a new stateful tool detector
+func NewStreamingToolDetector() *StreamingToolDetector {
+	return &StreamingToolDetector{}
+}
+
+// Process handles a chunk of streaming content and separates tool calls from regular content
+func (s *StreamingToolDetector) Process(chunk string) (displayContent string, hasIncompleteToolCall bool) {
+	var result strings.Builder
+	
+	for i := 0; i < len(chunk); i++ {
+		ch := chunk[i]
+		
+		// Handle XML tool calls
+		if !s.inXMLToolCall && i+11 <= len(chunk) && chunk[i:i+11] == "<tool_call>" {
+			s.inXMLToolCall = true
+			s.xmlStartBuffer.Reset()
+			s.xmlStartBuffer.WriteString("<tool_call>")
+			i += 10 // Skip past "<tool_call>"
+			continue
+		}
+		
+		if s.inXMLToolCall {
+			s.xmlStartBuffer.WriteByte(ch)
+			if i+12 <= len(chunk) && chunk[i:i+12] == "</tool_call>" {
+				// Complete XML tool call - skip it entirely
+				s.inXMLToolCall = false
+				s.xmlStartBuffer.Reset()
+				i += 11 // Skip past "</tool_call>"
+				continue
+			}
+			continue
+		}
+		
+		// Handle JSON tool calls
+		if !s.inJSONToolCall && !s.inXMLToolCall {
+			// Look for start of JSON tool call pattern
+			if i+8 <= len(chunk) && chunk[i:i+8] == `{"name":` {
+				// Check if "arguments" appears nearby (tool call signature)
+				lookahead := chunk[i:]
+				if len(lookahead) > 200 {
+					lookahead = lookahead[:200]
+				}
+				if strings.Contains(lookahead, `"arguments":`) {
+					s.inJSONToolCall = true
+					s.jsonBuffer.Reset()
+					s.jsonBuffer.WriteByte(ch)
+					s.jsonDepth = 1
+					s.inString = false
+					s.escapeNext = false
+					continue
+				}
+			}
+		}
+		
+		if s.inJSONToolCall {
+			s.jsonBuffer.WriteByte(ch)
+			
+			// Track JSON structure to find the end
+			if s.escapeNext {
+				s.escapeNext = false
+				continue
+			}
+			
+			if ch == '\\' && s.inString {
+				s.escapeNext = true
+				continue
+			}
+			
+			if ch == '"' && !s.escapeNext {
+				s.inString = !s.inString
+				continue
+			}
+			
+			if !s.inString {
+				if ch == '{' {
+					s.jsonDepth++
+				} else if ch == '}' {
+					s.jsonDepth--
+					if s.jsonDepth == 0 {
+						// Complete JSON tool call - skip it
+						s.inJSONToolCall = false
+						s.jsonBuffer.Reset()
+						continue
+					}
+				}
+			}
+			continue
+		}
+		
+		// Regular content
+		result.WriteByte(ch)
+	}
+	
+	// Check if we have incomplete tool calls that need buffering
+	hasIncompleteToolCall = s.inXMLToolCall || s.inJSONToolCall
+	
+	return result.String(), hasIncompleteToolCall
+}
+
+// Reset clears the detector state
+func (s *StreamingToolDetector) Reset() {
+	s.inXMLToolCall = false
+	s.xmlStartBuffer.Reset()
+	s.inJSONToolCall = false
+	s.jsonBuffer.Reset()
+	s.jsonDepth = 0
+	s.inString = false
+	s.escapeNext = false
+}
+
+// findJSONEnd finds the end of a JSON object starting from the beginning of the string
+// Returns the index of the closing brace, or -1 if not found
+func findJSONEnd(s string) int {
+	braceCount := 0
+	inString := false
+	escapeNext := false
+	
+	for i, ch := range s {
+		if escapeNext {
+			escapeNext = false
+			continue
+		}
+		
+		if ch == '\\' && inString {
+			escapeNext = true
+			continue
+		}
+		
+		if ch == '"' && !escapeNext {
+			inString = !inString
+			continue
+		}
+		
+		if !inString {
+			if ch == '{' {
+				braceCount++
+			} else if ch == '}' {
+				braceCount--
+				if braceCount == 0 {
+					return i
+				}
+			}
+		}
+	}
+	
+	return -1
+}
+
+// getToolBufferDelay returns the configured tool buffer delay
+// Can be overridden with OLLAMA_TOOL_BUFFER_DELAY environment variable (in milliseconds)
+func getToolBufferDelay() time.Duration {
+	if delayStr := os.Getenv("OLLAMA_TOOL_BUFFER_DELAY"); delayStr != "" {
+		if delayMs, err := strconv.Atoi(delayStr); err == nil {
+			delay := time.Duration(delayMs) * time.Millisecond
+			// Clamp to reasonable bounds
+			if delay < MinToolBufferDelay {
+				return MinToolBufferDelay
+			}
+			if delay > MaxToolBufferDelay {
+				return MaxToolBufferDelay
+			}
+			return delay
+		}
+	}
+	return DefaultToolBufferDelay
+}
+
 func displayResponse(content string, wordWrap bool, state *displayResponseState) {
 	termWidth, _, _ := term.GetSize(int(os.Stdout.Fd()))
 	if wordWrap && termWidth >= 10 {
@@ -1339,6 +1525,17 @@ func chat(cmd *cobra.Command, opts runOptions) (*api.Message, error) {
 	var thinkTagOpened bool = false
 	var thinkTagClosed bool = false
 	var toolCallsDisplayed bool = false
+	
+	// Streaming tool detector for better chunk handling
+	toolDetector := NewStreamingToolDetector()
+	
+	// Buffer for accumulating content before display
+	var contentBuffer strings.Builder
+	var bufferTimer *time.Timer
+	var bufferMutex sync.Mutex
+	
+	// Get configurable buffer delay
+	bufferDelay := getToolBufferDelay()
 
 	role := "assistant"
 
@@ -1371,48 +1568,55 @@ func chat(cmd *cobra.Command, opts runOptions) (*api.Message, error) {
 			state = &displayResponseState{}
 		}
 		
-		// Aggressively filter out raw tool call JSON from content display
-		displayContent := content
-		
-		// Check for any JSON that looks like a tool call (even incomplete ones)
-		// Pattern: {"name": ... even without closing braces
-		if idx := strings.Index(displayContent, `{"name":`); idx != -1 {
-			// Keep only content before the JSON tool call
-			displayContent = displayContent[:idx]
-			// Trim trailing whitespace
-			displayContent = strings.TrimRight(displayContent, " \n\r\t")
-		}
-		
-		// Also filter out patterns that look like incomplete JSON tool calls
-		// Sometimes the model outputs: {"name": "tool_name", "arguments": {"key": 
-		// (without closing the JSON)
-		if idx := strings.Index(displayContent, `"arguments":`); idx != -1 {
-			// Find the start of this JSON object
-			jsonStart := strings.LastIndex(displayContent[:idx], "{")
-			if jsonStart != -1 {
-				displayContent = displayContent[:jsonStart]
-				displayContent = strings.TrimRight(displayContent, " \n\r\t")
-			}
-		}
-		
-		// Filter out XML-wrapped tool calls
-		if idx := strings.Index(displayContent, "<tool_call>"); idx != -1 {
-			displayContent = displayContent[:idx]
-			displayContent = strings.TrimRight(displayContent, " \n\r\t")
-		}
-		
-		// Remove any stray closing tags
-		displayContent = strings.ReplaceAll(displayContent, "</tool_call>", "")
-		displayContent = strings.ReplaceAll(displayContent, "}</tool_call>", "")
+		// Use stateful tool detector for better streaming chunk handling
+		displayContent, hasIncompleteToolCall := toolDetector.Process(content)
 		
 		// Store full response for context
 		fullResponse.WriteString(content)
 
+		// Buffer management based on tool detection
+		if hasIncompleteToolCall {
+			// We have an incomplete tool call - buffer the content
+			bufferMutex.Lock()
+			contentBuffer.WriteString(displayContent)
+			
+			// Cancel any existing timer
+			if bufferTimer != nil {
+				bufferTimer.Stop()
+			}
+			
+			// Set a new timer to flush the buffer after a delay
+			bufferTimer = time.AfterFunc(bufferDelay, func() {
+				bufferMutex.Lock()
+				defer bufferMutex.Unlock()
+				
+				bufferedContent := contentBuffer.String()
+				contentBuffer.Reset()
+				
+				// Reset tool detector state when flushing
+				toolDetector.Reset()
+				
+				// Only display if there's actual content after filtering
+				if strings.TrimSpace(bufferedContent) != "" {
+					displayResponse(bufferedContent, opts.WordWrap, state)
+				}
+			})
+			bufferMutex.Unlock()
+		} else {
+			// No incomplete tool call - display immediately
+			if strings.TrimSpace(displayContent) != "" {
+				displayResponse(displayContent, opts.WordWrap, state)
+			}
+		}
+		
 		// Display tool calls cleanly if detected
 		if response.Message.ToolCalls != nil {
 			toolCalls := response.Message.ToolCalls
 			if len(toolCalls) > 0 && !toolCallsDisplayed {
-				fmt.Println() // New line before tool execution
+				// Only add newline if we displayed content
+				if strings.TrimSpace(displayContent) != "" {
+					fmt.Println()
+				}
 				fmt.Print(renderToolCalls(toolCalls, false))
 				toolCallsDisplayed = true
 			}
@@ -1425,12 +1629,6 @@ func chat(cmd *cobra.Command, opts runOptions) (*api.Message, error) {
 				fmt.Print(renderToolResults(toolResults, false))
 				fmt.Println() // New line after results
 			}
-		}
-
-		// Display the filtered content (without raw tool JSON)
-		// Only display if there's actual content after filtering
-		if strings.TrimSpace(displayContent) != "" {
-			displayResponse(displayContent, opts.WordWrap, state)
 		}
 
 		return nil
@@ -1467,6 +1665,20 @@ func chat(cmd *cobra.Command, opts runOptions) (*api.Message, error) {
 		}
 		return nil, err
 	}
+	
+	// Flush any remaining buffered content
+	bufferMutex.Lock()
+	if bufferTimer != nil {
+		bufferTimer.Stop()
+	}
+	if contentBuffer.Len() > 0 {
+		bufferedContent := contentBuffer.String()
+		contentBuffer.Reset()
+		if strings.TrimSpace(bufferedContent) != "" && !strings.Contains(bufferedContent, `{"name":`) {
+			displayResponse(bufferedContent, opts.WordWrap, state)
+		}
+	}
+	bufferMutex.Unlock()
 
 	if len(opts.Messages) > 0 {
 		fmt.Println()
@@ -2053,9 +2265,12 @@ func renderToolResults(toolResults []api.ToolResult, plainText bool) string {
 	out := ""
 	formatExplanation := ""
 	formatValues := ""
+	formatError := ""
 	if !plainText {
 		formatExplanation = readline.ColorGrey + readline.ColorBold
 		formatValues = readline.ColorDefault
+		// Use bold for errors since ColorRed doesn't exist
+		formatError = readline.ColorBold
 		out += formatExplanation
 	}
 	for i, toolResult := range toolResults {
@@ -2063,7 +2278,26 @@ func renderToolResults(toolResults []api.ToolResult, plainText bool) string {
 			out += "\n"
 		}
 		if toolResult.Error != "" {
-			out += fmt.Sprintf("❌ Tool '%s' failed: %s\n", formatValues+toolResult.ToolName+formatExplanation, formatValues+toolResult.Error+formatExplanation)
+			// Parse error for better context
+			errorMsg := toolResult.Error
+			// Try to extract meaningful error from MCP errors
+			if strings.Contains(errorMsg, "MCP tool returned error") {
+				errorMsg = "Tool execution failed"
+			}
+			// Look for specific error patterns
+			if strings.Contains(toolResult.Error, "Parent directory does not exist") {
+				errorMsg = "Parent directory does not exist - check path"
+			} else if strings.Contains(toolResult.Error, "permission denied") {
+				errorMsg = "Permission denied - insufficient privileges"
+			} else if strings.Contains(toolResult.Error, "Invalid arguments") {
+				errorMsg = "Invalid tool arguments provided"
+			} else if strings.Contains(toolResult.Error, "file not found") {
+				errorMsg = "File or directory not found"
+			}
+			
+			out += fmt.Sprintf("❌ Tool '%s' failed: %s%s%s\n", 
+				formatValues+toolResult.ToolName+formatExplanation, 
+				formatError, errorMsg, formatExplanation)
 		} else {
 			// Truncate very long results for display
 			content := toolResult.Content
