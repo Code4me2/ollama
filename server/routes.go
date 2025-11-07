@@ -2617,8 +2617,9 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			
 			// Model called tools - execute them if we have an MCP manager
 			if mcpManager != nil {
-				slog.Info("Executing tools via MCP", 
-					"count", len(completionResult.ToolCalls), 
+				slog.Info("EXECUTION_DEBUG", 
+					"tools_in_response", len(completionResult.ToolCalls),
+					"valid_tools", validToolCalls,
 					"round", round)
 				
 				// Analyze execution plan
@@ -2647,15 +2648,23 @@ func (s *Server) ChatHandler(c *gin.Context) {
 				}
 				currentMsgs = append(currentMsgs, assistantMsg)
 				
-				// Add tool result messages
+				// Add tool result messages and send them to client for display
+				toolResultsForDisplay := make([]api.ToolResult, 0, len(results))
 				for i, result := range results {
 					toolMsg := api.Message{
 						Role:     "tool",
 						ToolName: completionResult.ToolCalls[i].Function.Name,
 					}
 					
+					// Create display result
+					displayResult := api.ToolResult{
+						ToolName: completionResult.ToolCalls[i].Function.Name,
+						Content:  result.Content,
+					}
+					
 					if result.Error != nil {
 						toolMsg.Content = fmt.Sprintf("Error: %v", result.Error)
+						displayResult.Error = result.Error.Error()
 						slog.Warn("Tool execution failed", 
 							"tool", completionResult.ToolCalls[i].Function.Name, 
 							"error", result.Error)
@@ -2664,6 +2673,18 @@ func (s *Server) ChatHandler(c *gin.Context) {
 					}
 					
 					currentMsgs = append(currentMsgs, toolMsg)
+					toolResultsForDisplay = append(toolResultsForDisplay, displayResult)
+				}
+				
+				// Send tool results to client for display
+				if len(toolResultsForDisplay) > 0 {
+					ch <- api.ChatResponse{
+						Model: req.Model,
+						Message: api.Message{
+							Role:        "assistant",
+							ToolResults: toolResultsForDisplay,
+						},
+					}
 				}
 				
 				// Continue to next round - model will process tool results

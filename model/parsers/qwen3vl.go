@@ -77,8 +77,6 @@ func (qwenEventThinkingContent) isQwenEvent() {}
 func (p *Qwen3VLParser) Add(s string, done bool) (content string, thinking string, calls []api.ToolCall, err error) {
 	p.buffer.WriteString(s)
 	
-	// Debug logging removed
-	
 	events := p.parseEvents()
 
 	var currentToolCalls []api.ToolCall
@@ -95,6 +93,10 @@ func (p *Qwen3VLParser) Add(s string, done bool) (content string, thinking strin
 			currentToolCalls = append(currentToolCalls, toolCall)
 			// Store tool calls for final return when done=true
 			p.processedToolCalls = append(p.processedToolCalls, toolCall)
+			slog.Debug("TOOL_ACCUMULATED",
+				"tool_name", toolCall.Function.Name,
+				"total_accumulated", len(p.processedToolCalls),
+				"in_current_chunk", len(currentToolCalls))
 		case qwenEventThinkingContent:
 			thinkingSb.WriteString(event.content)
 		case qwenEventContent:
@@ -108,7 +110,9 @@ func (p *Qwen3VLParser) Add(s string, done bool) (content string, thinking strin
 	if done && len(p.processedToolCalls) > 0 {
 		allToolCalls := p.processedToolCalls
 		p.processedToolCalls = nil // Reset for next use
-		// Debug logging removed
+		slog.Info("TOOL_FINAL_RETURN",
+			"total_tools", len(allToolCalls),
+			"buffer_remaining", p.buffer.String()[:min(100, len(p.buffer.String()))])
 		return contentSb.String(), thinkingSb.String(), allToolCalls, nil
 	}
 
@@ -181,7 +185,15 @@ func (p *Qwen3VLParser) eat() ([]qwenEvent, bool) {
 				jsonContent := remaining[xmlStartLen:xmlEnd]
 				jsonContent = strings.TrimSpace(jsonContent)
 				
+				// Try to fix incomplete JSON
+				jsonContent = fixIncompleteJSON(jsonContent)
+				
 				after := remaining[xmlEnd+len("</tool_call>"):]
+				
+				slog.Debug("TOOL_PARSE_XML",
+					"found_tool", jsonContent,
+					"buffer_remaining", len(after),
+					"after_preview", after[:min(50, len(after))])
 				
 				events = append(events, qwenEventRawToolCall{raw: jsonContent})
 				p.buffer.Reset()
@@ -210,6 +222,11 @@ func (p *Qwen3VLParser) eat() ([]qwenEvent, bool) {
 				
 				jsonToolCall := remaining[:jsonEnd+1]
 				after := remaining[jsonEnd+1:]
+				
+				slog.Debug("TOOL_PARSE_JSON",
+					"found_tool", jsonToolCall,
+					"buffer_remaining", len(after),
+					"after_preview", after[:min(50, len(after))])
 				
 				events = append(events, qwenEventRawToolCall{raw: jsonToolCall})
 				p.buffer.Reset()
@@ -291,8 +308,16 @@ func (p *Qwen3VLParser) eat() ([]qwenEvent, bool) {
 }
 
 func parseJSONToolCall(raw qwenEventRawToolCall, tools []api.Tool) (api.ToolCall, error) {
+	// Try to fix incomplete JSON first
+	fixedJSON := fixIncompleteJSON(raw.raw)
+	
 	var toolCallFunction api.ToolCallFunction
-	if err := json.Unmarshal([]byte(raw.raw), &toolCallFunction); err != nil {
+	if err := json.Unmarshal([]byte(fixedJSON), &toolCallFunction); err != nil {
+		// Log the original and fixed JSON for debugging
+		slog.Warn("Failed to parse tool call JSON",
+			"original", raw.raw,
+			"fixed", fixedJSON,
+			"error", err)
 		return api.ToolCall{}, err
 	}
 
@@ -338,4 +363,81 @@ func findJSONObjectEnd(s string) int {
 	}
 	
 	return -1 // No complete JSON object found
+}
+
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// fixIncompleteJSON attempts to fix incomplete JSON by adding missing closing braces
+func fixIncompleteJSON(jsonStr string) string {
+	// First, normalize whitespace - replace newlines and excessive spaces
+	jsonStr = strings.ReplaceAll(jsonStr, "\n", " ")
+	jsonStr = strings.ReplaceAll(jsonStr, "\r", " ")
+	jsonStr = strings.TrimSpace(jsonStr)
+	
+	// Remove any trailing incomplete content after the last valid character
+	// Common pattern: the JSON gets cut off mid-string
+	
+	// Check if we're in an incomplete string (odd number of unescaped quotes)
+	inString := false
+	escaped := false
+	
+	for _, ch := range jsonStr {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' {
+			escaped = true
+			continue
+		}
+		if ch == '"' {
+			inString = !inString
+		}
+	}
+	
+	// If we're still in a string, close it
+	if inString {
+		jsonStr += `"`
+	}
+	
+	// Count braces to add missing ones
+	openBraces := 0
+	closeBraces := 0
+	inStr := false
+	esc := false
+	
+	for _, ch := range jsonStr {
+		if esc {
+			esc = false
+			continue
+		}
+		if ch == '\\' {
+			esc = true
+			continue
+		}
+		if ch == '"' {
+			inStr = !inStr
+			continue
+		}
+		if !inStr {
+			if ch == '{' {
+				openBraces++
+			} else if ch == '}' {
+				closeBraces++
+			}
+		}
+	}
+	
+	// Add missing closing braces
+	for i := closeBraces; i < openBraces; i++ {
+		jsonStr += "}"
+	}
+	
+	return jsonStr
 }

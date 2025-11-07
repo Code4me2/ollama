@@ -1370,28 +1370,68 @@ func chat(cmd *cobra.Command, opts runOptions) (*api.Message, error) {
 			thinkTagClosed = true
 			state = &displayResponseState{}
 		}
-		// purposefully not putting thinking blocks in the response, which would
-		// only be needed if we later added tool calling to the cli (they get
-		// filtered out anyway since current models don't expect them unless you're
-		// about to finish some tool calls)
+		
+		// Aggressively filter out raw tool call JSON from content display
+		displayContent := content
+		
+		// Check for any JSON that looks like a tool call (even incomplete ones)
+		// Pattern: {"name": ... even without closing braces
+		if idx := strings.Index(displayContent, `{"name":`); idx != -1 {
+			// Keep only content before the JSON tool call
+			displayContent = displayContent[:idx]
+			// Trim trailing whitespace
+			displayContent = strings.TrimRight(displayContent, " \n\r\t")
+		}
+		
+		// Also filter out patterns that look like incomplete JSON tool calls
+		// Sometimes the model outputs: {"name": "tool_name", "arguments": {"key": 
+		// (without closing the JSON)
+		if idx := strings.Index(displayContent, `"arguments":`); idx != -1 {
+			// Find the start of this JSON object
+			jsonStart := strings.LastIndex(displayContent[:idx], "{")
+			if jsonStart != -1 {
+				displayContent = displayContent[:jsonStart]
+				displayContent = strings.TrimRight(displayContent, " \n\r\t")
+			}
+		}
+		
+		// Filter out XML-wrapped tool calls
+		if idx := strings.Index(displayContent, "<tool_call>"); idx != -1 {
+			displayContent = displayContent[:idx]
+			displayContent = strings.TrimRight(displayContent, " \n\r\t")
+		}
+		
+		// Remove any stray closing tags
+		displayContent = strings.ReplaceAll(displayContent, "</tool_call>", "")
+		displayContent = strings.ReplaceAll(displayContent, "}</tool_call>", "")
+		
+		// Store full response for context
 		fullResponse.WriteString(content)
 
+		// Display tool calls cleanly if detected
 		if response.Message.ToolCalls != nil {
 			toolCalls := response.Message.ToolCalls
 			if len(toolCalls) > 0 && !toolCallsDisplayed {
+				fmt.Println() // New line before tool execution
 				fmt.Print(renderToolCalls(toolCalls, false))
 				toolCallsDisplayed = true
 			}
 		}
 		
+		// Display tool results if available
 		if response.Message.ToolResults != nil {
 			toolResults := response.Message.ToolResults
 			if len(toolResults) > 0 {
 				fmt.Print(renderToolResults(toolResults, false))
+				fmt.Println() // New line after results
 			}
 		}
 
-		displayResponse(content, opts.WordWrap, state)
+		// Display the filtered content (without raw tool JSON)
+		// Only display if there's actual content after filtering
+		if strings.TrimSpace(displayContent) != "" {
+			displayResponse(displayContent, opts.WordWrap, state)
+		}
 
 		return nil
 	}
@@ -1982,15 +2022,26 @@ func renderToolCalls(toolCalls []api.ToolCall, plainText bool) string {
 		out += formatExplanation
 	}
 	for i, toolCall := range toolCalls {
-		argsAsJSON, err := json.Marshal(toolCall.Function.Arguments)
-		if err != nil {
-			return ""
-		}
 		if i > 0 {
 			out += "\n"
 		}
-		// Show tool execution in progress
-		out += fmt.Sprintf("  🔧 Executing tool '%s' with arguments: %s", formatValues+toolCall.Function.Name+formatExplanation, formatValues+string(argsAsJSON)+formatExplanation)
+		// Format arguments in a more readable way
+		var argsDisplay string
+		// Arguments is already a map[string]any
+		var pairs []string
+		for k, v := range toolCall.Function.Arguments {
+			pairs = append(pairs, fmt.Sprintf("%s: %v", k, v))
+		}
+		if len(pairs) > 0 {
+			argsDisplay = strings.Join(pairs, ", ")
+		} else {
+			argsDisplay = "(no arguments)"
+		}
+		
+		// Show tool execution in progress with cleaner format
+		out += fmt.Sprintf("\n🔧 Executing tool '%s' with arguments: %s%s%s\n", 
+			formatValues+toolCall.Function.Name+formatExplanation, 
+			formatValues, argsDisplay, formatExplanation)
 	}
 	if !plainText {
 		out += readline.ColorDefault
@@ -2012,9 +2063,14 @@ func renderToolResults(toolResults []api.ToolResult, plainText bool) string {
 			out += "\n"
 		}
 		if toolResult.Error != "" {
-			out += fmt.Sprintf("  ❌ Tool '%s' failed: %s", formatValues+toolResult.ToolName+formatExplanation, formatValues+toolResult.Error+formatExplanation)
+			out += fmt.Sprintf("❌ Tool '%s' failed: %s\n", formatValues+toolResult.ToolName+formatExplanation, formatValues+toolResult.Error+formatExplanation)
 		} else {
-			out += fmt.Sprintf("  ✅ Tool '%s' result: %s", formatValues+toolResult.ToolName+formatExplanation, formatValues+toolResult.Content+formatExplanation)
+			// Truncate very long results for display
+			content := toolResult.Content
+			if len(content) > 200 {
+				content = content[:197] + "..."
+			}
+			out += fmt.Sprintf("✅ Tool '%s' result: %s\n", formatValues+toolResult.ToolName+formatExplanation, formatValues+content+formatExplanation)
 		}
 	}
 	if !plainText {
