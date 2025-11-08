@@ -2251,8 +2251,10 @@ func renderToolCalls(toolCalls []api.ToolCall, plainText bool) string {
 		}
 		
 		// Show tool execution in progress with cleaner format
-		out += fmt.Sprintf("\n🔧 Executing tool '%s' with arguments: %s%s%s\n", 
-			formatValues+toolCall.Function.Name+formatExplanation, 
+		// Add newline before tool, and format arguments on separate line
+		out += fmt.Sprintf("\n🔧 Executing tool '%s'%s\n", 
+			formatValues+toolCall.Function.Name+formatExplanation, formatExplanation)
+		out += fmt.Sprintf("   Arguments: %s%s%s\n", 
 			formatValues, argsDisplay, formatExplanation)
 	}
 	if !plainText {
@@ -2295,8 +2297,9 @@ func renderToolResults(toolResults []api.ToolResult, plainText bool) string {
 				errorMsg = "File or directory not found"
 			}
 			
-			out += fmt.Sprintf("❌ Tool '%s' failed: %s%s%s\n", 
-				formatValues+toolResult.ToolName+formatExplanation, 
+			out += fmt.Sprintf("\n❌ Tool '%s' failed\n", 
+				formatValues+toolResult.ToolName+formatExplanation)
+			out += fmt.Sprintf("   Error: %s%s%s\n\n", 
 				formatError, errorMsg, formatExplanation)
 		} else {
 			// Truncate very long results for display
@@ -2304,7 +2307,10 @@ func renderToolResults(toolResults []api.ToolResult, plainText bool) string {
 			if len(content) > 200 {
 				content = content[:197] + "..."
 			}
-			out += fmt.Sprintf("✅ Tool '%s' result: %s\n", formatValues+toolResult.ToolName+formatExplanation, formatValues+content+formatExplanation)
+			out += fmt.Sprintf("\n✅ Tool '%s' completed\n", 
+				formatValues+toolResult.ToolName+formatExplanation)
+			out += fmt.Sprintf("   Result:\n%s%s%s\n\n", 
+				formatValues, content, formatExplanation)
 		}
 	}
 	if !plainText {
