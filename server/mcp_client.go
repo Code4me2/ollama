@@ -213,6 +213,41 @@ func (c *MCPClient) Start() error {
 	go c.handleResponses()
 	go c.handleErrors()
 
+	// Check if the process is still running after a brief delay
+	// This catches immediate failures like command not found
+	processCheckDone := make(chan bool, 1)
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		// Non-blocking check if process has exited
+		if c.cmd.ProcessState != nil {
+			processCheckDone <- false
+			return
+		}
+		// Try to check process existence without waiting
+		if c.cmd.Process != nil {
+			// On Unix systems, signal 0 can be used to check process existence
+			if err := c.cmd.Process.Signal(syscall.Signal(0)); err != nil {
+				processCheckDone <- false
+				return
+			}
+		}
+		processCheckDone <- true
+	}()
+
+	select {
+	case alive := <-processCheckDone:
+		if !alive {
+			// Process died immediately - collect the error
+			waitErr := c.cmd.Wait()
+			c.stdin.Close()
+			stdout.Close() 
+			stderr.Close()
+			return fmt.Errorf("MCP server exited immediately: %w", waitErr)
+		}
+	case <-time.After(200 * time.Millisecond):
+		// Process seems to be running, continue
+	}
+
 	return nil
 }
 
@@ -221,6 +256,10 @@ func (c *MCPClient) Initialize() error {
 	if err := c.Start(); err != nil {
 		return err
 	}
+
+	// Add timeout to initialization to prevent hanging
+	initCtx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
+	defer cancel()
 
 	// Send initialize request
 	req := mcpInitializeRequest{
@@ -235,7 +274,7 @@ func (c *MCPClient) Initialize() error {
 	}
 
 	var resp mcpInitializeResponse
-	if err := c.call("initialize", req, &resp); err != nil {
+	if err := c.callWithContext(initCtx, "initialize", req, &resp); err != nil {
 		return fmt.Errorf("MCP initialize failed: %w", err)
 	}
 
