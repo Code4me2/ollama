@@ -4,9 +4,11 @@
   </a>
 </div>
 
-# Ollama
+# Ollama with MCP (Model Context Protocol) Integration
 
-Get up and running with large language models.
+Get up and running with large language models that can execute tools and interact with external systems.
+
+> **Note**: This fork includes experimental MCP support for autonomous tool execution. See [MCP Documentation](./MCP_BUILD_AND_RUN.md) for details.
 
 ### macOS
 
@@ -144,6 +146,39 @@ Hello! It's your friend Mario.
 ```
 
 For more information on working with a Modelfile, see the [Modelfile](https://docs.ollama.com/modelfile) documentation.
+
+## MCP (Model Context Protocol) Support
+
+This fork includes experimental support for the Model Context Protocol, allowing models to execute tools autonomously:
+
+### Quick Example
+
+```shell
+# Run with filesystem tools
+ollama run qwen2.5:7b --tools /safe/directory
+>>> List all markdown files in the directory
+# Model will execute filesystem:list_directory tool automatically
+
+# Use via API with custom MCP servers
+curl -X POST http://localhost:11434/api/chat \
+  -d '{
+    "model": "qwen2.5:7b",
+    "messages": [{"role": "user", "content": "Search for TODO comments"}],
+    "mcp_servers": [{
+      "name": "git",
+      "command": "npx",
+      "args": ["@modelcontextprotocol/server-git"],
+      "env": {}
+    }]
+  }'
+```
+
+### MCP Documentation
+
+- [Build and Run Instructions](./MCP_BUILD_AND_RUN.md)
+- [API Documentation](./MCP_API_DOCUMENTATION.md)
+- [System Requirements](./docs/MCP_REQUIREMENTS.md)
+- [Security Configuration](./examples/mcp-security.json)
 
 ## CLI Reference
 

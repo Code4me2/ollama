@@ -15,3 +15,22 @@ __debug_bin*
 llama/build
 llama/vendor
 /ollama
+
+# Log files
+*.log
+server_*.log
+test*.log
+multi_round*.log
+debug*.log
+refactored*.log
+ollama_server*.log
+
+# Test artifacts
+tool_response.json
+test_*.json
+*.test
+
+# Temporary files
+*.tmp
+*.bak
+*~
