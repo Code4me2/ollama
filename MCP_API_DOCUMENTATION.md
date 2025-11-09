@@ -1,8 +1,14 @@
 # MCP (Model Context Protocol) API Documentation
 
+**Status**: Experimental Implementation  
+**Last Updated**: November 9, 2024  
+**Development Timeline**: November 7-9, 2024
+
 ## Overview
 
 The MCP integration in Ollama enables autonomous tool execution during model inference. This allows language models to interact with external systems and tools via the Model Context Protocol without requiring client-side tool handling.
+
+⚠️ **Note**: This is an experimental implementation that is actively being developed. Features and APIs may change.
 
 ## API Endpoints
 
@@ -82,37 +88,42 @@ ollama run llama3.1 \
   --mcp weather:python:-m:weather_mcp_server
 ```
 
-## Security Features
+## Security Features (IMPLEMENTED)
 
-### 1. Environment Variable Filtering
+### 1. Environment Variable Filtering ✅
 
-The MCP integration automatically filters sensitive environment variables to prevent credential leakage:
+The MCP integration uses an allowlist approach for environment variables:
 
-**Filtered Variables:**
-- AWS credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
-- API keys (`*_API_KEY`, `*_TOKEN`)
-- Authentication tokens (`GITHUB_TOKEN`, `GITLAB_TOKEN`)
+**Implementation**: `server/mcp_client.go:buildSecureEnvironment()`
+
+**Allowed Variables Only:**
+- `PATH` (with sanitization to remove /root/* and relative paths)
+- `HOME`, `USER`
+- `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`
+- `TMPDIR`, `TEMP`, `TMP`, `TERM`
+- `PYTHONPATH`, `NODE_PATH`
+- `DISPLAY`, `EDITOR`
+
+**Automatically Filtered:**
+- All AWS credentials
+- All API keys and tokens
 - SSH/GPG agent information
 - Database credentials
-- Any variable containing `SECRET`, `PASSWORD`, `TOKEN`, or `KEY`
+- Any variable matching sensitive patterns
 
-**Allowed Variables:**
-- `PATH` (sanitized)
-- `HOME`, `USER`
-- `LANG`, `LC_ALL`, `TZ`
-- `TMPDIR`, `TEMP`, `TMP`
-- `PYTHONPATH`, `NODE_PATH`
+### 2. Command Validation ✅
 
-### 2. Command Validation
+**Implementation**: `server/mcp_validator.go` and `server/mcp_security_config.go`
 
-Dangerous commands are blocked for security:
+Dangerous commands are blocked with comprehensive validation:
 
 **Blocked Commands:**
-- Shell interpreters: `sh`, `bash`, `zsh`, etc.
-- Privilege escalation: `sudo`, `su`, `doas`
-- Destructive commands: `rm`, `dd`, `mkfs`
-- Network tools: `curl`, `wget`, `nc`
-- System management: `systemctl`, `service`
+- Shell interpreters: `sh`, `bash`, `zsh`, `fish`, `cmd`, `powershell`
+- Privilege escalation: `sudo`, `su`, `doas`, `runas`
+- Destructive commands: `rm`, `dd`, `mkfs`, `format`
+- Network tools: `curl`, `wget`, `nc`, `telnet`, `ssh`
+- System management: `systemctl`, `service`, `init`
+- Script execution: `eval`, `exec`, `source`
 
 ### 3. Path Sanitization
 
@@ -128,12 +139,16 @@ Tool arguments are validated to prevent:
 - Path traversal (blocks `..`)
 - Command substitution
 
-### 5. Process Isolation
+### 5. Process Isolation ✅
+
+**Implementation**: `server/mcp_client.go:Initialize()`
 
 MCP servers run with:
-- Separate process groups
-- Resource limits
-- Timeout enforcement (30 seconds default)
+- Separate process groups (`Setpgid: true`)
+- Syscall restrictions via `SysProcAttr`
+- Timeout enforcement (30 seconds default, configurable)
+- Graceful shutdown with SIGTERM → wait 5s → SIGKILL
+- Process cleanup on context cancellation
 
 ## Configuration Examples
 
@@ -385,13 +400,15 @@ response = ollama.chat(
 # Tools executed automatically, final response returned
 ```
 
-## Limitations
+## Current Limitations
 
-1. **Platform Support:** Linux/macOS (Windows support pending)
-2. **Protocol:** MCP 1.0 only
-3. **Transport:** stdio only (no HTTP/WebSocket yet)
-4. **Models:** Best with tool-capable models (Qwen, Llama 3.1+)
-5. **Concurrency:** Max 10 parallel MCP servers
+1. **Maturity:** Very recent implementation (Nov 7-9, 2024) - experimental status
+2. **Platform Support:** Linux/macOS tested (Windows support untested)
+3. **Protocol:** MCP 1.0 only
+4. **Transport:** stdio only (no HTTP/WebSocket yet)
+5. **Models:** Optimized for Qwen models, basic support for others
+6. **Concurrency:** Max 10 parallel MCP servers
+7. **Testing:** Limited real-world testing, needs stabilization period
 
 ## Future Enhancements
 
