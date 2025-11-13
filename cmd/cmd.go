@@ -391,57 +391,84 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if toolsSpec != "" {
-		// Parse tools specification: "type:path" or just "path" for filesystem
-		parts := strings.SplitN(toolsSpec, ":", 2)
-		serverType := "filesystem"
-		path := toolsSpec
-		
-		if len(parts) == 2 {
-			serverType = parts[0]
-			path = parts[1]
+		// Load the MCP server registry
+		registry, err := server.LoadMCPRegistry()
+		if err != nil {
+			// If registry fails to load, fall back to basic filesystem support
+			fmt.Fprintf(os.Stderr, "Warning: Failed to load MCP server registry: %v\n", err)
+			registry = &server.MCPServerRegistry{
+				Servers: map[string]server.MCPServerDefinition{
+					"filesystem": {
+						Name:         "filesystem",
+						Description:  "File system operations",
+						Command:      "npx",
+						Args:         []string{"-y", "@modelcontextprotocol/server-filesystem"},
+						RequiresPath: true,
+					},
+				},
+			}
 		}
 		
-		// For backward compatibility, treat plain paths as filesystem
-		if !strings.Contains(toolsSpec, ":") && strings.HasPrefix(toolsSpec, "/") {
-			serverType = "filesystem"
-			path = toolsSpec
+		// Determine the filesystem path
+		filesystemPath := "."  // Default to current directory
+		if toolsSpec != "" && toolsSpec != "." && toolsSpec != "true" {
+			// If a path is provided, use it for the filesystem server
+			filesystemPath = toolsSpec
 		}
 		
-		// Create MCP server config based on type
-		switch serverType {
-		case "filesystem", "fs":
-			opts.MCPServers = []api.MCPServerConfig{
+		// Get current working directory if using "."
+		if filesystemPath == "." {
+			if cwd, err := os.Getwd(); err == nil {
+				filesystemPath = cwd
+			}
+		}
+		
+		// Build the list of MCP servers from the registry
+		var mcpServers []api.MCPServerConfig
+		
+		// Add all registered servers
+		for name, def := range registry.Servers {
+			config := api.MCPServerConfig{
+				Name:    def.Name,
+				Command: def.Command,
+				Args:    append([]string{}, def.Args...), // Copy args
+				Env:     make(map[string]string),
+			}
+			
+			// Copy environment variables
+			for k, v := range def.Env {
+				config.Env[k] = v
+			}
+			
+			// Handle filesystem server specially - add the path
+			if name == "filesystem" && def.RequiresPath {
+				config.Args = append(config.Args, filesystemPath)
+			}
+			
+			mcpServers = append(mcpServers, config)
+		}
+		
+		// If no servers were loaded from registry, ensure at least filesystem is available
+		if len(mcpServers) == 0 {
+			mcpServers = []api.MCPServerConfig{
 				{
 					Name:    "filesystem",
 					Command: "npx",
-					Args:    []string{"@modelcontextprotocol/server-filesystem", path},
+					Args:    []string{"-y", "@modelcontextprotocol/server-filesystem", filesystemPath},
 				},
 			}
-		case "git":
-			opts.MCPServers = []api.MCPServerConfig{
-				{
-					Name:    "git",
-					Command: "npx",
-					Args:    []string{"@modelcontextprotocol/server-git", path},
-				},
-			}
-		case "python":
-			opts.MCPServers = []api.MCPServerConfig{
-				{
-					Name:    "python",
-					Command: "python",
-					Args:    []string{"-m", "mcp_server_python"},
-				},
-			}
-		default:
-			// Try to use as a raw MCP server command
-			opts.MCPServers = []api.MCPServerConfig{
-				{
-					Name:    serverType,
-					Command: serverType,
-					Args:    strings.Fields(path),
-				},
-			}
+		}
+		
+		opts.MCPServers = mcpServers
+		
+		// Log what servers are being enabled
+		serverNames := make([]string, 0, len(mcpServers))
+		for _, srv := range mcpServers {
+			serverNames = append(serverNames, srv.Name)
+		}
+		fmt.Fprintf(os.Stderr, "Enabling MCP servers: %s\n", strings.Join(serverNames, ", "))
+		if filesystemPath != "." {
+			fmt.Fprintf(os.Stderr, "Filesystem server path: %s\n", filesystemPath)
 		}
 	}
 
@@ -2023,7 +2050,7 @@ func NewCLI() *cobra.Command {
 	runCmd.Flags().String("think", "", "Enable thinking mode: true/false or high/medium/low for supported models")
 	runCmd.Flags().Lookup("think").NoOptDefVal = "true"
 	runCmd.Flags().Bool("hidethinking", false, "Hide thinking output (if provided)")
-	runCmd.Flags().String("tools", "", "Enable MCP tools (filesystem:/path, git:/repo, python, or custom:args)")
+	runCmd.Flags().String("tools", "", "Enable MCP tools (default: all registered servers with current dir, or specify path for filesystem)")
 
 	stopCmd := &cobra.Command{
 		Use:     "stop MODEL",

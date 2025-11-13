@@ -30,10 +30,19 @@ type MCPServerDefinition struct {
 // DefaultMCPServers returns minimal built-in MCP server definitions
 // Full examples are provided in examples/mcp-servers.json
 func DefaultMCPServers() map[string]MCPServerDefinition {
-	// Return empty map by default - users should configure their own servers
-	// This ensures the open source distribution doesn't make assumptions
-	// about available MCP servers in the user's environment
-	return map[string]MCPServerDefinition{}
+	// Only include filesystem by default - it requires only npx which is commonly available
+	// Users can add more servers via ~/.ollama/mcp-servers.json
+	return map[string]MCPServerDefinition{
+		"filesystem": {
+			Name:         "filesystem",
+			Description:  "File system operations with path-based access control",
+			Command:      "npx",
+			Args:         []string{"-y", "@modelcontextprotocol/server-filesystem"},
+			RequiresPath: true,
+			PathArgIndex: -1,
+			Capabilities: []string{"read", "write", "list", "search"},
+		},
+	}
 }
 
 // LoadMCPRegistry loads MCP server configurations from various sources
@@ -43,12 +52,13 @@ func LoadMCPRegistry() (*MCPServerRegistry, error) {
 	}
 
 	// Load from user config if exists
-	// Priority order: user config > system config > example > defaults
+	// Priority order: user config > system config > defaults
 	configPaths := []string{
 		filepath.Join(os.Getenv("HOME"), ".ollama", "mcp-servers.json"),
 		"/etc/ollama/mcp-servers.json",
 		"./mcp-servers.json",
-		"./examples/mcp-servers.json", // Example configuration as fallback
+		// NOTE: examples/mcp-servers.json is NOT loaded by default
+		// Users should copy it to ~/.ollama/mcp-servers.json if they want all servers
 	}
 
 	for _, path := range configPaths {
