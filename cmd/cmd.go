@@ -423,6 +423,17 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 			}
 		}
 		
+		// Expand tilde and resolve absolute path
+		if strings.HasPrefix(filesystemPath, "~") {
+			if home := os.Getenv("HOME"); home != "" {
+				filesystemPath = filepath.Join(home, filesystemPath[1:])
+			}
+		}
+		// Ensure we have an absolute path
+		if absPath, err := filepath.Abs(filesystemPath); err == nil {
+			filesystemPath = absPath
+		}
+		
 		// Build the list of MCP servers from the registry
 		var mcpServers []api.MCPServerConfig
 		
