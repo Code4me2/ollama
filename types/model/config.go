@@ -9,6 +9,7 @@ type ConfigV2 struct {
 	FileType      string   `json:"file_type"`  // shown as Quantization Level
 	Renderer      string   `json:"renderer,omitempty"`
 	Parser        string   `json:"parser,omitempty"`
+	Think         *bool    `json:"think,omitempty"`
 	Requires      string   `json:"requires,omitempty"`
 
 	RemoteHost  string `json:"remote_host,omitempty"`

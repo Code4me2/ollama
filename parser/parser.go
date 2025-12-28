@@ -105,6 +105,17 @@ func (f Modelfile) CreateRequest(relativeDir string) (*api.CreateRequest, error)
 			req.Renderer = c.Args
 		case "parser":
 			req.Parser = c.Args
+		case "think":
+			switch strings.ToLower(c.Args) {
+			case "true", "1", "yes", "on":
+				t := true
+				req.Think = &t
+			case "false", "0", "no", "off":
+				t := false
+				req.Think = &t
+			default:
+				return nil, fmt.Errorf("think must be true or false")
+			}
 		case "requires":
 			// golang.org/x/mod/semver requires "v" prefix
 			requires := c.Args
@@ -359,7 +370,7 @@ const (
 var (
 	errMissingFrom        = errors.New("no FROM line")
 	errInvalidMessageRole = errors.New("message role must be one of \"system\", \"user\", or \"assistant\"")
-	errInvalidCommand     = errors.New("command must be one of \"from\", \"license\", \"template\", \"system\", \"adapter\", \"renderer\", \"parser\", \"parameter\", \"message\", or \"requires\"")
+	errInvalidCommand     = errors.New("command must be one of \"from\", \"license\", \"template\", \"system\", \"adapter\", \"renderer\", \"parser\", \"think\", \"parameter\", \"message\", or \"requires\"")
 )
 
 type ParserError struct {
@@ -619,7 +630,7 @@ func isValidMessageRole(role string) bool {
 
 func isValidCommand(cmd string) bool {
 	switch strings.ToLower(cmd) {
-	case "from", "license", "template", "system", "adapter", "renderer", "parser", "parameter", "message", "requires":
+	case "from", "license", "template", "system", "adapter", "renderer", "parser", "think", "parameter", "message", "requires":
 		return true
 	default:
 		return false

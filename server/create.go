@@ -61,6 +61,7 @@ func (s *Server) CreateHandler(c *gin.Context) {
 
 	config.Renderer = r.Renderer
 	config.Parser = r.Parser
+	config.Think = r.Think
 	config.Requires = r.Requires
 
 	for v := range r.Files {
@@ -121,7 +122,7 @@ func (s *Server) CreateHandler(c *gin.Context) {
 					ch <- gin.H{"error": err.Error()}
 				}
 
-				if err == nil && !remote && (config.Renderer == "" || config.Parser == "" || config.Requires == "") {
+				if err == nil && !remote && (config.Renderer == "" || config.Parser == "" || config.Requires == "" || config.Think == nil) {
 					manifest, mErr := ParseNamedManifest(fromName)
 					if mErr == nil && manifest.Config.Digest != "" {
 						configPath, pErr := GetBlobsPath(manifest.Config.Digest)
@@ -134,6 +135,9 @@ func (s *Server) CreateHandler(c *gin.Context) {
 									}
 									if config.Parser == "" {
 										config.Parser = baseConfig.Parser
+									}
+									if config.Think == nil {
+										config.Think = baseConfig.Think
 									}
 									if config.Requires == "" {
 										config.Requires = baseConfig.Requires

@@ -228,6 +228,21 @@ PARSER parser1
 	assert.Equal(t, []Command{{Name: "model", Args: "foo"}, {Name: "parser", Args: "parser1"}}, modelfile.Commands)
 }
 
+func TestParseFileThink(t *testing.T) {
+	input := `
+FROM foo
+THINK false
+`
+	modelfile, err := ParseFile(strings.NewReader(input))
+	require.NoError(t, err)
+
+	req, err := modelfile.CreateRequest(".")
+	require.NoError(t, err)
+
+	want := false
+	assert.Equal(t, &want, req.Think)
+}
+
 func TestParseFileMessages(t *testing.T) {
 	cases := []struct {
 		input    string

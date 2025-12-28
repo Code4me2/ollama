@@ -360,7 +360,12 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 	if slices.Contains(modelCaps, model.CapabilityThinking) {
 		caps = append(caps, model.CapabilityThinking)
 		if req.Think == nil {
-			req.Think = &api.ThinkValue{Value: true}
+			// Use model's configured default, or true if not set
+			if m.Config.Think != nil {
+				req.Think = &api.ThinkValue{Value: *m.Config.Think}
+			} else {
+				req.Think = &api.ThinkValue{Value: true}
+			}
 		}
 	} else {
 		if req.Think != nil && req.Think.Bool() {
@@ -2009,7 +2014,12 @@ func (s *Server) ChatHandler(c *gin.Context) {
 	if slices.Contains(modelCaps, model.CapabilityThinking) {
 		caps = append(caps, model.CapabilityThinking)
 		if req.Think == nil {
-			req.Think = &api.ThinkValue{Value: true}
+			// Use model's configured default, or true if not set
+			if m.Config.Think != nil {
+				req.Think = &api.ThinkValue{Value: *m.Config.Think}
+			} else {
+				req.Think = &api.ThinkValue{Value: true}
+			}
 		}
 	} else {
 		if req.Think != nil && req.Think.Bool() {

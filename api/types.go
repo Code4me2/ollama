@@ -553,6 +553,7 @@ type CreateRequest struct {
 
 	Renderer string `json:"renderer,omitempty"`
 	Parser   string `json:"parser,omitempty"`
+	Think    *bool  `json:"think,omitempty"`
 
 	// Requires is the minimum version of Ollama required by the model.
 	Requires string `json:"requires,omitempty"`

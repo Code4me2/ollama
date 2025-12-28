@@ -1914,43 +1914,20 @@ func NewCLI() *cobra.Command {
 }
 
 // If the user has explicitly set thinking options, either through the CLI or
-// through the `/set think` or `set nothink` interactive options, then we
-// respect them. Otherwise, we check model capabilities to see if the model
-// supports thinking. If the model does support thinking, we enable it.
-// Otherwise, we unset the thinking option (which is different than setting it
-// to false).
-//
-// If capabilities are not provided, we fetch them from the server.
+// through the `/set think` or `/set nothink` interactive options, then we
+// respect them. Otherwise, we return nil to let the server use the model's
+// configured default (m.Config.Think from the Modelfile's THINK command).
+// If the model doesn't have an explicit Think config, the server defaults to
+// enabling thinking for models that support it.
 func inferThinkingOption(caps *[]model.Capability, runOpts *runOptions, explicitlySetByUser bool) (*api.ThinkValue, error) {
 	if explicitlySetByUser {
 		return runOpts.Think, nil
 	}
 
-	if caps == nil {
-		client, err := api.ClientFromEnvironment()
-		if err != nil {
-			return nil, err
-		}
-		ret, err := client.Show(context.Background(), &api.ShowRequest{
-			Model: runOpts.Model,
-		})
-		if err != nil {
-			return nil, err
-		}
-		caps = &ret.Capabilities
-	}
-
-	thinkingSupported := false
-	for _, cap := range *caps {
-		if cap == model.CapabilityThinking {
-			thinkingSupported = true
-		}
-	}
-
-	if thinkingSupported {
-		return &api.ThinkValue{Value: true}, nil
-	}
-
+	// Return nil and let the server use the model's config (m.Config.Think)
+	// which may have been set via THINK command in the Modelfile.
+	// The server will default to enabling thinking if the model supports it
+	// and doesn't have an explicit Think config.
 	return nil, nil
 }
 
